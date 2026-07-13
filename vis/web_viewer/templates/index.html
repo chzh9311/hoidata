@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HOI Web Viewer — {{ dataset_name }} / {{ split }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "{{ url_for('static', filename='vendor/three.module.js') }}",
+      "three/addons/controls/OrbitControls.js": "{{ url_for('static', filename='vendor/OrbitControls.js') }}"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <button id="prevBtn" class="nav" title="Previous sequence">&lt;</button>
+      <select id="seqSelect">
+        {% for s in sequences %}
+        <option value="{{ s.index }}">#{{ s.index }} — {{ s.obj_name }} / {{ s.action_name }} ({{ s.nframes }}f)</option>
+        {% endfor %}
+      </select>
+      <button id="nextBtn" class="nav" title="Next sequence">&gt;</button>
+      <span class="label" id="seqLabel"></span>
+    </div>
+
+    <div id="viewport">
+      <div id="status">initializing…</div>
+    </div>
+
+    <div id="controls">
+      <button id="playBtn">Pause</button>
+      <input type="range" id="progress" min="0" max="0" value="0" step="1">
+      <span id="frameReadout">0 / 0</span>
+    </div>
+  </div>
+
+  <script>
+    window.__FPS__ = {{ fps }};
+  </script>
+  <script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
+</body>
+</html>

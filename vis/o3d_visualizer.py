@@ -69,22 +69,12 @@ def _pose_grab_object(cfg, ds, index, item):
     return proc_numpy(obj_verts_t), np.asarray(mesh.faces)
 
 
-def load_sample(cfg, dataset_name: str, split: str = "test", index: int = 0) -> dict:
-    """Load one full sequence from the GRAB/ARCTIC dataloader, with hand and
-    object meshes already posed per frame.
+def build_dataset(cfg, dataset_name: str, split: str = "test"):
+    """Build the MANO hand layers and the full-sequence (``task="evaluate"``)
+    dataloader once, so callers can pose individual sequences on demand without
+    re-instantiating everything per index (see ``pose_sample``).
 
-    Returns a dict:
-        hand_verts : (T, 778 or 1556, 3) float32, world-space MANO vertices
-        hand_faces : dict {'left': (1538,3), 'right': (1538,3)} int64 — MANO's
-                     left/right topologies have opposite face winding (the two
-                     hands are mirrored, not just re-translated), so they are
-                     kept separate rather than shared
-        hand_sides : list[str], 'left'/'right' per active hand, matching the
-                     778-vert blocks in hand_verts
-        obj_verts  : (T, V, 3) float32, world-space object mesh vertices
-        obj_faces  : (F, 3) int, static object mesh topology
-        nframes    : int
-        obj_name, action_name : str
+    Returns ``(ds, lhand_layer, rhand_layer)``.
     """
     # This repo's x-data convention stores a full 48-D axis-angle pose (3 global
     # + 45 per-joint, one 3-vector per finger joint), not manopth's default 6-D
@@ -114,6 +104,26 @@ def load_sample(cfg, dataset_name: str, split: str = "test", index: int = 0) -> 
         lhand_layer=lhand_layer,
         rhand_layer=rhand_layer,
     )
+    return ds, lhand_layer, rhand_layer
+
+
+def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Pose one full sequence from an already-built dataset, returning hand and
+    object meshes already posed per frame.
+
+    Returns a dict:
+        hand_verts : (T, 778 or 1556, 3) float32, world-space MANO vertices
+        hand_faces : dict {'left': (1538,3), 'right': (1538,3)} int64 — MANO's
+                     left/right topologies have opposite face winding (the two
+                     hands are mirrored, not just re-translated), so they are
+                     kept separate rather than shared
+        hand_sides : list[str], 'left'/'right' per active hand, matching the
+                     778-vert blocks in hand_verts
+        obj_verts  : (T, V, 3) float32, world-space object mesh vertices
+        obj_faces  : (F, 3) int, static object mesh topology
+        nframes    : int
+        obj_name, action_name : str
+    """
     item = ds[index]
 
     if dataset_name == "arctic":
@@ -140,6 +150,17 @@ def load_sample(cfg, dataset_name: str, split: str = "test", index: int = 0) -> 
         "obj_name": item["obj_name"],
         "action_name": item["action_name"],
     }
+
+
+def load_sample(cfg, dataset_name: str, split: str = "test", index: int = 0) -> dict:
+    """Convenience wrapper: build the dataset and pose one sequence in one call.
+
+    Equivalent to ``build_dataset(...)`` followed by ``pose_sample(...)``.
+    Kept for the standalone o3d CLI and existing callers; a long-lived server
+    should instead call ``build_dataset`` once and ``pose_sample`` per index.
+    """
+    ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, split)
+    return pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index)
 
 
 def build_hand_mesh(hand_verts_frame, hand_sides, hand_faces) -> o3d.geometry.TriangleMesh:

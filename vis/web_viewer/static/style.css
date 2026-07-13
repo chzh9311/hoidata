@@ -1,0 +1,106 @@
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #e8e8ec;
+  background: #1b1d23;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* --- top bar --- */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #24272f;
+  border-bottom: 1px solid #333743;
+  flex-wrap: wrap;
+}
+
+#topbar select {
+  flex: 1 1 320px;
+  min-width: 220px;
+  max-width: 640px;
+  padding: 6px 8px;
+  background: #1b1d23;
+  color: #e8e8ec;
+  border: 1px solid #3a3f4b;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+#topbar .label {
+  font-size: 13px;
+  color: #9aa0ad;
+  white-space: nowrap;
+}
+
+button {
+  padding: 6px 12px;
+  background: #3a5bd0;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+button:hover { background: #4a6ae0; }
+button:disabled { background: #3a3f4b; color: #777; cursor: default; }
+button.nav { background: #333743; }
+button.nav:hover { background: #414653; }
+
+/* --- viewport --- */
+#viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+#viewport canvas { display: block; width: 100%; height: 100%; }
+
+#status {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  font-size: 12px;
+  color: #9aa0ad;
+  background: rgba(0,0,0,0.35);
+  padding: 4px 8px;
+  border-radius: 5px;
+  pointer-events: none;
+}
+#status.loading { color: #ffd479; }
+
+/* --- bottom controls --- */
+#controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #24272f;
+  border-top: 1px solid #333743;
+}
+
+#playBtn { min-width: 74px; }
+
+#progress {
+  flex: 1 1 auto;
+  accent-color: #4a6ae0;
+  cursor: pointer;
+}
+
+#frameReadout {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: #c3c8d2;
+  min-width: 78px;
+  text-align: right;
+}
