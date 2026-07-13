@@ -35,6 +35,13 @@ from vis.o3d_visualizer import build_dataset, pose_sample
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
 OBJECT_COLOR = [0.6, 0.7, 0.9]
 
+# Progress-bar / active-label colors by annotated hand type (0..1 RGB).
+LABEL_COLORS = {
+    "left":  [0.20, 0.45, 0.95],   # blue
+    "right": [0.90, 0.25, 0.25],   # red
+    "both":  [0.25, 0.75, 0.35],   # green
+}
+
 app = Flask(__name__)
 
 # Populated by main() before app.run().
@@ -104,13 +111,23 @@ def _serialize_sample(sample):
     for i, side in enumerate(hand_sides):
         _add(f"hand_verts_{side}", hand_verts[:, i * 778:(i + 1) * 778], np.float32)
 
+    # Annotation intervals (may be empty). Keys are plain ints/str → JSON-safe.
+    labels = [
+        {"start": int(l["start"]), "end": int(l["end"]),
+         "hand": str(l["hand"]), "action": str(l.get("action", ""))}
+        for l in sample.get("labels", [])
+    ]
+
     meta = {
         "nframes": nframes,
         "hand_sides": hand_sides,
         "obj_name": str(sample["obj_name"]),
         "action_name": str(sample["action_name"]),
+        "subject": str(sample.get("subject", "")),
         "hand_colors": {s: HAND_SIDE_COLORS[s] for s in hand_sides},
         "obj_color": OBJECT_COLOR,
+        "label_colors": LABEL_COLORS,
+        "labels": labels,
         "fps": STATE["fps"],
         "arrays": manifest,
     }

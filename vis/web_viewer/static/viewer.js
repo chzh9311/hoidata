@@ -9,8 +9,11 @@ const prevBtn = document.getElementById('prevBtn');
 const nextBtn = document.getElementById('nextBtn');
 const seqLabel = document.getElementById('seqLabel');
 const playBtn = document.getElementById('playBtn');
-const progress = document.getElementById('progress');
 const frameReadout = document.getElementById('frameReadout');
+const scrub = document.getElementById('scrub');
+const segTrack = document.getElementById('segTrack');
+const playhead = document.getElementById('playhead');
+const activeLabelEl = document.getElementById('activeLabel');
 
 const FPS = window.__FPS__ || 30;
 
@@ -46,13 +49,20 @@ function resize() {
 window.addEventListener('resize', resize);
 
 // ---------------------------------------------------------------- scene state
-// One entry per rendered mesh: { mesh, positions (Float32Array T*V*3), V }.
+// One entry per rendered mesh: { mesh, positions (Float32Array T*V*3), V,
+//   baseColor (THREE.Color) }.
 let meshes = [];
 let nframes = 0;
 let frameIdx = 0;
 let playing = true;
 let lastTick = 0;
 let loading = false;
+
+// Annotation state for the loaded sequence.
+let labels = [];              // [{start, end, hand, action}]
+let labelColors = {};          // {left|right|both -> [r,g,b] 0..1}
+let activeLabelIdx = -1;       // which label is highlighted right now (-1 none)
+let segEls = [];               // DOM nodes for each label's colored block
 
 function clearMeshes() {
   for (const m of meshes) {
@@ -88,6 +98,9 @@ function viewArray(buffer, entry) {
 function buildScene(meta, buffer) {
   clearMeshes();
   nframes = meta.nframes;
+  labels = meta.labels || [];
+  labelColors = meta.label_colors || {};
+  activeLabelIdx = -1;
 
   const arrays = meta.arrays;
   const objFaces = new Uint32Array(viewArray(buffer, arrays.obj_faces)); // copy to Uint32
@@ -97,6 +110,7 @@ function buildScene(meta, buffer) {
   meshes.push({
     mesh: makeMesh(objVerts.subarray(0, Vo * 3), objFaces, meta.obj_color, Vo),
     positions: objVerts, V: Vo,
+    baseColor: new THREE.Color(...meta.obj_color),
   });
 
   for (const side of meta.hand_sides) {
@@ -105,16 +119,92 @@ function buildScene(meta, buffer) {
     const V = vertsEntry.shape[1];
     const faces = new Uint32Array(viewArray(buffer, facesEntry));
     const verts = viewArray(buffer, vertsEntry);
+    const col = meta.hand_colors[side];
     meshes.push({
-      mesh: makeMesh(verts.subarray(0, V * 3), faces, meta.hand_colors[side], V),
+      mesh: makeMesh(verts.subarray(0, V * 3), faces, col, V),
       positions: verts, V,
+      baseColor: new THREE.Color(...col),
     });
   }
 
+  renderLabelTrack();
   frameSceneToBBox();
   setFrame(0);
-  progress.max = String(Math.max(nframes - 1, 0));
-  progress.value = '0';
+}
+
+function rgbCss(c) {
+  return `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
+}
+
+// Build the segmented bar: one solid colored block per labelled interval,
+// positioned by frame fraction, showing the action text (image-style).
+function renderLabelTrack() {
+  segTrack.innerHTML = '';
+  segEls = [];
+  if (nframes <= 0) return;
+  const span = nframes;   // fraction of the full frame count [0, nframes)
+  for (const lab of labels) {
+    const seg = document.createElement('div');
+    seg.className = 'seg';
+    const left = (lab.start / span) * 100;
+    const width = Math.max(((lab.end - lab.start) / span) * 100, 0.4);
+    const c = labelColors[lab.hand] || [0.6, 0.6, 0.6];
+    seg.style.left = left + '%';
+    seg.style.width = width + '%';
+    seg.style.background = rgbCss(c);
+    seg.title = `${lab.start}-${lab.end}  ${lab.action} (${lab.hand})`;
+
+    const txt = document.createElement('span');
+    txt.className = 'segtext';
+    txt.textContent = lab.action || '';
+    seg.appendChild(txt);
+
+    segTrack.appendChild(seg);
+    segEls.push(seg);
+  }
+}
+
+// Move the playhead line to frame t's horizontal position.
+function updatePlayhead(t) {
+  const frac = nframes > 1 ? t / (nframes - 1) : 0;
+  playhead.style.left = (frac * 100) + '%';
+}
+
+// The label whose interval contains frame t (last one wins on overlap), or -1.
+function labelAtFrame(t) {
+  let found = -1;
+  for (let i = 0; i < labels.length; i++) {
+    if (t >= labels[i].start && t < labels[i].end) found = i;
+  }
+  return found;
+}
+
+// Recolor meshes to signal "this frame is annotated": when inside a label the
+// meshes take the label's hand-type color; outside, they revert to base colors.
+function applyLabelHighlight(t) {
+  const idx = labelAtFrame(t);
+  if (idx === activeLabelIdx) return;   // no change → skip the material churn
+
+  // Un-emphasise the previously active segment block.
+  if (activeLabelIdx >= 0 && segEls[activeLabelIdx]) {
+    segEls[activeLabelIdx].classList.remove('active');
+  }
+  activeLabelIdx = idx;
+
+  if (idx < 0) {
+    for (const m of meshes) m.mesh.material.color.copy(m.baseColor);
+    activeLabelEl.textContent = '';
+    return;
+  }
+  if (segEls[idx]) segEls[idx].classList.add('active');
+  const lab = labels[idx];
+  const c = labelColors[lab.hand] || [0.6, 0.6, 0.6];
+  const hi = new THREE.Color(c[0], c[1], c[2]);
+  for (const m of meshes) {
+    // Blend base color toward the label color so shapes stay readable.
+    m.mesh.material.color.copy(m.baseColor).lerp(hi, 0.6);
+  }
+  activeLabelEl.textContent = `${lab.action || '—'} · ${lab.hand}`;
 }
 
 // Frame the camera to the full-sequence bounding box (all frames, all meshes),
@@ -157,7 +247,8 @@ function setFrame(t) {
     attr.needsUpdate = true;
     m.mesh.geometry.computeVertexNormals();
   }
-  progress.value = String(t);
+  applyLabelHighlight(t);
+  updatePlayhead(t);
   frameReadout.textContent = `${t + 1} / ${nframes}`;
 }
 
@@ -207,21 +298,37 @@ async function loadSequence(index) {
 // ---------------------------------------------------------------- UI wiring
 playBtn.addEventListener('click', () => setPlaying(!playing));
 
-// Scrubbing: pause while dragging, resume on release if it was playing.
+// Scrubbing on the custom segmented bar: click or drag to seek. Playback pauses
+// while dragging and resumes on release if it was playing.
+let scrubbing = false;
 let wasPlayingBeforeScrub = false;
-progress.addEventListener('pointerdown', () => {
+
+function frameFromEvent(e) {
+  const rect = scrub.getBoundingClientRect();
+  let frac = (e.clientX - rect.left) / rect.width;
+  frac = Math.max(0, Math.min(1, frac));
+  return Math.round(frac * Math.max(nframes - 1, 0));
+}
+
+scrub.addEventListener('pointerdown', (e) => {
+  if (nframes <= 0) return;
+  scrubbing = true;
   wasPlayingBeforeScrub = playing;
   setPlaying(false);
+  scrub.setPointerCapture(e.pointerId);
+  setFrame(frameFromEvent(e));
 });
-progress.addEventListener('input', () => {
-  if (nframes > 0) setFrame(parseInt(progress.value, 10));
+scrub.addEventListener('pointermove', (e) => {
+  if (scrubbing) setFrame(frameFromEvent(e));
 });
-progress.addEventListener('pointerup', () => {
-  if (wasPlayingBeforeScrub) setPlaying(true);
-});
-progress.addEventListener('change', () => {
-  if (wasPlayingBeforeScrub) setPlaying(true);
-});
+function endScrub(e) {
+  if (!scrubbing) return;
+  scrubbing = false;
+  try { scrub.releasePointerCapture(e.pointerId); } catch (_) {}
+  if (wasPlayingBeforeScrub) { setPlaying(true); lastTick = performance.now(); }
+}
+scrub.addEventListener('pointerup', endScrub);
+scrub.addEventListener('pointercancel', endScrub);
 
 function selectAndLoad(index) {
   const clamped = Math.max(0, Math.min(seqSelect.options.length - 1, index));

@@ -34,8 +34,9 @@ import json
 import os
 import os.path as osp
 import pickle
+import re
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 
 import hydra
 import numpy as np
@@ -72,6 +73,79 @@ from constants.arctic_constants import (
     third_verb,
     passive_verb,
 )
+
+
+def parse_description_labels(text_file):
+    """Tolerant parser for a sequence's ``description.txt`` annotation.
+
+    Each line looks like ``<start>-<end> <action>, <hand_type>`` but the raw
+    annotations are messy: hand types carry typos (``rigth``, ``hnad``,
+    ``both hand``), the comma is sometimes missing, and the *same* interval is
+    often listed several times (e.g. ``open, both hands`` and ``open, right
+    hand``).  Per the labelling convention, an interval tagged with ``both`` —
+    or with both ``left`` and ``right`` across its lines — is resolved to
+    ``both``; otherwise it takes whichever single side it carries.
+
+    Frame numbers in the file are 1-indexed inclusive; the returned intervals are
+    0-indexed with an exclusive ``end`` (``start = sf - 1``, ``end = ef``), so
+    they index directly into the full-sequence (``full_motion``) frames.
+
+    Returns a list of dicts sorted by (start, end):
+        {"start": int, "end": int, "hand": "left"|"right"|"both", "action": str}
+    """
+    groups = defaultdict(lambda: {"hands": set(), "action": None})
+    with open(text_file) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.match(r"\s*(\d+)\s*-\s*(\d+)\s+(.*)$", line)
+            if not m:
+                continue
+            sf, ef = int(m.group(1)), int(m.group(2))
+            rest = m.group(3).replace(",", " ").lower()
+
+            if "both" in rest:
+                hand = "both"
+            else:
+                has_l = "left" in rest or "lhand" in rest
+                has_r = bool(re.search(r"rig?th|right|rihgt|rhand", rest))
+                if has_l and has_r:
+                    hand = "both"
+                elif has_l:
+                    hand = "left"
+                elif has_r:
+                    hand = "right"
+                else:
+                    continue  # unparseable hand token — skip the line
+
+            action = re.sub(
+                r"\b(left|right|rigth|rihgt|both|hand|hands|hnad)\b", "", rest)
+            action = re.sub(r"\s+", " ", action).strip()
+
+            g = groups[(sf, ef)]
+            g["hands"].add(hand)
+            if g["action"] is None and action:
+                g["action"] = action
+
+    labels = []
+    for (sf, ef), g in groups.items():
+        hands = g["hands"]
+        if "both" in hands or ("left" in hands and "right" in hands):
+            hand = "both"
+        elif "left" in hands:
+            hand = "left"
+        elif "right" in hands:
+            hand = "right"
+        else:
+            continue
+        start, end = sf - 1, ef
+        if end <= start:
+            continue  # drop degenerate intervals
+        labels.append({"start": start, "end": end, "hand": hand,
+                       "action": g["action"] or ""})
+    labels.sort(key=lambda d: (d["start"], d["end"]))
+    return labels
 
 
 def preprocessing_object(cfg):
@@ -162,6 +236,7 @@ def preprocessing_data(cfg):
         "rcf_idx", "rcov_idx", "rchj_idx", "rdist_value",
         "is_lhand", "is_rhand",
         "object_name", "action_name", "nframes",
+        "subject", "labels",
     ]}
 
     full_motion = cfg.full_motion
@@ -207,6 +282,21 @@ def preprocessing_data(cfg):
                     nframes = len(lhand_poses)
                     seq_name = osp.basename(obj_path).replace(".object.npy", "")
 
+                    # Parse the per-sequence annotation into frame-labelled
+                    # intervals (left/right/both), clamped to this sequence's
+                    # frame count.  The web viewer colours the progress bar and
+                    # recolours the meshes inside these intervals.
+                    desc_file = osp.join(
+                        cfg.text_root, subj, seq_name, "description.txt")
+                    if osp.exists(desc_file):
+                        labels = parse_description_labels(desc_file)
+                        for lab in labels:
+                            lab["start"] = max(0, min(lab["start"], nframes))
+                            lab["end"] = max(0, min(lab["end"], nframes))
+                        labels = [l for l in labels if l["end"] > l["start"]]
+                    else:
+                        labels = []
+
                     obj_rot_th = proc_torch_cuda(obj_rots)
                     obj_trans_th = proc_torch_cuda(obj_trans) / 1000  # mm → m
                     obj_rotmat_th = axis_angle_to_rotmat(obj_rot_th)
@@ -245,6 +335,8 @@ def preprocessing_data(cfg):
                     extra["object_name"].append(obj_name)
                     extra["action_name"].append(seq_name)
                     extra["nframes"].append(nframes)
+                    extra["subject"].append(subj)
+                    extra["labels"].append(labels)
 
                 else:
                     # Read annotation file for this sequence.
@@ -347,6 +439,11 @@ def preprocessing_data(cfg):
                         extra["object_name"].append(obj_name)
                         extra["action_name"].append(action_name)
                         extra["nframes"].append(ef - sf)
+                        # subject/labels are only consumed by the full_motion
+                        # (whole-sequence) viewer path; keep the columns aligned
+                        # for the clip path with the subject and no intervals.
+                        extra["subject"].append(subj)
+                        extra["labels"].append([])
 
     final_dict = align_frame({k: lists[k] for k in [
         "x_lhand", "x_rhand", "j_lhand", "j_rhand",
@@ -364,6 +461,7 @@ def preprocessing_data(cfg):
     ragged_keys = {
         "lcf_idx", "lcov_idx", "lchj_idx", "ldist_value",
         "rcf_idx", "rcov_idx", "rchj_idx", "rdist_value",
+        "labels",  # per-row list of interval dicts (variable length)
     }
 
     def _to_array(key, value):

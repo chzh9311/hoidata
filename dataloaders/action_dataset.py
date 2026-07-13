@@ -371,6 +371,12 @@ class MotionDatasetBase(Dataset):
         }
         # Object trajectory (+ articulation for ARCTIC) is dataset-specific.
         item.update(self._obj_traj_from_xobj(self.x_obj[index][:nframes], nframes))
+        # Optional per-sequence annotation intervals + subject (ARCTIC full_motion
+        # data only); used by the web viewer to colour labelled frame ranges.
+        if getattr(self, "labels", None) is not None:
+            item["labels"] = list(self.labels[index])
+        if getattr(self, "subject", None) is not None:
+            item["subject"] = str(self.subject[index])
         return item
 
     def _getitem_windowed(self, index):

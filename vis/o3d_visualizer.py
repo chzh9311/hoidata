@@ -149,6 +149,10 @@ def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0)
         "nframes": item["nframes"],
         "obj_name": item["obj_name"],
         "action_name": item["action_name"],
+        # Per-sequence annotation intervals (ARCTIC full_motion only); empty list
+        # when unavailable. Each: {start, end, hand: left|right|both, action}.
+        "labels": item.get("labels", []),
+        "subject": item.get("subject", ""),
     }
 
 

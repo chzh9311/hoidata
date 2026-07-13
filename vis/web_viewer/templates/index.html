@@ -33,8 +33,21 @@
 
     <div id="controls">
       <button id="playBtn">Pause</button>
-      <input type="range" id="progress" min="0" max="0" value="0" step="1">
+      <!-- Custom segmented scrub bar: colored blocks per labelled interval with
+           the action text, an unlabelled base track, and a moving playhead.
+           Click / drag anywhere on it to scrub. -->
+      <div id="scrub" title="Click or drag to scrub">
+        <div id="baseTrack"></div>
+        <div id="segTrack"></div>
+        <div id="playhead"></div>
+      </div>
       <span id="frameReadout">0 / 0</span>
+    </div>
+    <div id="legend">
+      <span><i class="sw" style="background:#3373f2"></i>left</span>
+      <span><i class="sw" style="background:#e64040"></i>right</span>
+      <span><i class="sw" style="background:#40bf59"></i>both</span>
+      <span id="activeLabel"></span>
     </div>
   </div>
 

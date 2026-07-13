@@ -38,6 +38,10 @@ class MotionARCTIC(MotionDatasetBase):
             self.is_rhand    = data["is_rhand"][mask]
             self.action_name = data["action_name"][mask]
             self.nframes     = data["nframes"][mask]
+            # Optional per-sequence annotation intervals + subject (present only
+            # in full_motion-preprocessed data.npz); consumed by the web viewer.
+            self.labels  = data["labels"][mask] if "labels" in data else None
+            self.subject = data["subject"][mask] if "subject" in data else None
             if task == "evaluate":
                 self.x_obj       = data["x_obj"][mask]
                 self.x_obj_angle = data["x_obj_angle"][mask]

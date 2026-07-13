@@ -91,10 +91,76 @@ button.nav:hover { background: #414653; }
 
 #playBtn { min-width: 74px; }
 
-#progress {
+/* segmented scrub bar -------------------------------------------------- */
+#scrub {
+  position: relative;
   flex: 1 1 auto;
-  accent-color: #4a6ae0;
+  height: 40px;
   cursor: pointer;
+  user-select: none;
+  touch-action: none;
+}
+
+/* faint base track spanning the whole (unlabelled) sequence */
+#baseTrack {
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 26px;
+  border-radius: 6px;
+  background: #2c303a;
+}
+
+/* holds the colored labelled blocks (absolutely positioned by % of frames) */
+#segTrack {
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 26px;
+}
+
+#segTrack .seg {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  box-sizing: border-box;
+  transition: filter 0.08s ease, box-shadow 0.08s ease;
+}
+#segTrack .seg .segtext {
+  font-size: 11px;
+  line-height: 1.05;
+  font-weight: 600;
+  color: #fff;
+  text-align: center;
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.45);
+  pointer-events: none;
+}
+/* the segment containing the current frame gets emphasised */
+#segTrack .seg.active {
+  filter: brightness(1.18);
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.85) inset;
+}
+
+/* thin vertical playhead over the whole bar */
+#playhead {
+  position: absolute;
+  top: 3px; bottom: 3px;
+  width: 2px;
+  background: #ffffff;
+  box-shadow: 0 0 3px rgba(0,0,0,0.6);
+  transform: translateX(-1px);
+  pointer-events: none;
 }
 
 #frameReadout {
@@ -103,4 +169,31 @@ button.nav:hover { background: #414653; }
   color: #c3c8d2;
   min-width: 78px;
   text-align: right;
+}
+
+/* legend --------------------------------------------------------------- */
+#legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 4px 14px 10px;
+  background: #24272f;
+  font-size: 12px;
+  color: #9aa0ad;
+}
+#legend .sw {
+  display: inline-block;
+  width: 11px; height: 11px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+#activeLabel {
+  margin-left: auto;
+  color: #dfe3ea;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
 }
