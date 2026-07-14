@@ -153,6 +153,8 @@ def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0)
         # when unavailable. Each: {start, end, hand: left|right|both, action}.
         "labels": item.get("labels", []),
         "subject": item.get("subject", ""),
+        # Stable-grasp intervals per side: {"left": [[s,e],...], "right": [...]}.
+        "grasps": item.get("grasps", {"left": [], "right": []}),
     }
 
 

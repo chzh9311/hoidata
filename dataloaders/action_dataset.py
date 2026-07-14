@@ -377,6 +377,8 @@ class MotionDatasetBase(Dataset):
             item["labels"] = list(self.labels[index])
         if getattr(self, "subject", None) is not None:
             item["subject"] = str(self.subject[index])
+        if getattr(self, "grasps", None) is not None:
+            item["grasps"] = self.grasps[index]
         return item
 
     def _getitem_windowed(self, index):

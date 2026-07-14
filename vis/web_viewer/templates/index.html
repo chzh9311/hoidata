@@ -32,21 +32,32 @@
     </div>
 
     <div id="controls">
-      <button id="playBtn">Pause</button>
-      <!-- Custom segmented scrub bar: colored blocks per labelled interval with
-           the action text, an unlabelled base track, and a moving playhead.
-           Click / drag anywhere on it to scrub. -->
+      <button id="playBtn" title="Pause (space)">⏸</button>
+      <!-- 3-track scrub bar: top = action labels (colored blocks + text);
+           middle = left-hand stable grasps (blue); bottom = right-hand stable
+           grasps (red). A single playhead spans all three. Click / drag
+           anywhere to scrub. -->
       <div id="scrub" title="Click or drag to scrub">
-        <div id="baseTrack"></div>
-        <div id="segTrack"></div>
-        <div id="playhead"></div>
+        <div class="track" id="trackAction">
+          <span class="trackName">action</span>
+          <div class="lane"><div class="base"></div><div class="segs" id="segAction"></div></div>
+        </div>
+        <div class="track" id="trackLeft">
+          <span class="trackName">L grasp</span>
+          <div class="lane"><div class="base"></div><div class="segs" id="segLeft"></div></div>
+        </div>
+        <div class="track" id="trackRight">
+          <span class="trackName">R grasp</span>
+          <div class="lane"><div class="base"></div><div class="segs" id="segRight"></div></div>
+        </div>
+        <div id="playhead"><div class="line"></div></div>
       </div>
       <span id="frameReadout">0 / 0</span>
     </div>
     <div id="legend">
-      <span><i class="sw" style="background:#3373f2"></i>left</span>
-      <span><i class="sw" style="background:#e64040"></i>right</span>
-      <span><i class="sw" style="background:#40bf59"></i>both</span>
+      <span><i class="sw" style="background:#40bf59"></i>action</span>
+      <span><i class="sw" style="background:#3373f2"></i>L grasp</span>
+      <span><i class="sw" style="background:#e64040"></i>R grasp</span>
       <span id="activeLabel"></span>
     </div>
   </div>

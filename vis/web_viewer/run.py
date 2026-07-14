@@ -118,6 +118,13 @@ def _serialize_sample(sample):
         for l in sample.get("labels", [])
     ]
 
+    # Stable-grasp intervals per side → JSON-safe [[start, end], ...].
+    raw_grasps = sample.get("grasps", {}) or {}
+    grasps = {
+        side: [[int(s), int(e)] for s, e in raw_grasps.get(side, [])]
+        for side in ("left", "right")
+    }
+
     meta = {
         "nframes": nframes,
         "hand_sides": hand_sides,
@@ -128,6 +135,7 @@ def _serialize_sample(sample):
         "obj_color": OBJECT_COLOR,
         "label_colors": LABEL_COLORS,
         "labels": labels,
+        "grasps": grasps,
         "fps": STATE["fps"],
         "arrays": manifest,
     }

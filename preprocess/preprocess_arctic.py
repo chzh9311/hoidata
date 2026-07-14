@@ -29,6 +29,7 @@ Expected config keys in configs/dataset/arctic.yaml:
     flat_hand:            bool, use flat-hand MANO mean pose
 """
 
+import csv
 import glob
 import json
 import os
@@ -148,6 +149,40 @@ def parse_description_labels(text_file):
     return labels
 
 
+def load_stable_grasps(csv_path):
+    """Load the stable-grasp intervals CSV, indexed by (subject, seq_name).
+
+    The CSV rows are ``sid_seq_name`` (e.g. ``s01/box_grab_01``), ``side``
+    (left|right), and ``start``/``end`` frames.  Returns a dict::
+
+        {(subject, seq_name): {"left": [[s, e], ...], "right": [[s, e], ...]}}
+
+    Intervals are kept as-is (0-indexed, [start, end)); the caller clamps them to
+    each sequence's frame count.  Sequences absent from the CSV simply have no
+    entry (empty grasps downstream).
+    """
+    grasps = defaultdict(lambda: {"left": [], "right": []})
+    if not osp.exists(csv_path):
+        print(f"[stable grasps] CSV not found: {csv_path} — skipping.")
+        return grasps
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            sid_seq = row["sid_seq_name"]
+            if "/" not in sid_seq:
+                continue
+            subject, seq_name = sid_seq.split("/", 1)
+            side = row["side"].strip().lower()
+            if side not in ("left", "right"):
+                continue
+            start, end = int(row["start"]), int(row["end"])
+            if end > start:
+                grasps[(subject, seq_name)][side].append([start, end])
+    for key in grasps:
+        for side in ("left", "right"):
+            grasps[key][side].sort()
+    return grasps
+
+
 def preprocessing_object(cfg):
     """Sample each object mesh to a 1024-point cloud and save as obj.pkl."""
     obj_pcs = {}
@@ -236,8 +271,12 @@ def preprocessing_data(cfg):
         "rcf_idx", "rcov_idx", "rchj_idx", "rdist_value",
         "is_lhand", "is_rhand",
         "object_name", "action_name", "nframes",
-        "subject", "labels",
+        "subject", "labels", "grasps",
     ]}
+
+    # Per-sequence stable-grasp intervals (left/right), indexed by (subject, seq).
+    stable_grasps = load_stable_grasps(
+        cfg.get("stable_grasp_csv", ""))
 
     full_motion = cfg.full_motion
 
@@ -297,6 +336,18 @@ def preprocessing_data(cfg):
                     else:
                         labels = []
 
+                    # Stable-grasp intervals for this sequence (per side), clamped
+                    # to the frame count.  Absent sequences → empty per-side lists.
+                    raw_grasps = stable_grasps.get((subj, seq_name),
+                                                   {"left": [], "right": []})
+                    grasps = {"left": [], "right": []}
+                    for side in ("left", "right"):
+                        for s, e in raw_grasps[side]:
+                            s = max(0, min(s, nframes))
+                            e = max(0, min(e, nframes))
+                            if e > s:
+                                grasps[side].append([s, e])
+
                     obj_rot_th = proc_torch_cuda(obj_rots)
                     obj_trans_th = proc_torch_cuda(obj_trans) / 1000  # mm → m
                     obj_rotmat_th = axis_angle_to_rotmat(obj_rot_th)
@@ -337,6 +388,7 @@ def preprocessing_data(cfg):
                     extra["nframes"].append(nframes)
                     extra["subject"].append(subj)
                     extra["labels"].append(labels)
+                    extra["grasps"].append(grasps)
 
                 else:
                     # Read annotation file for this sequence.
@@ -439,11 +491,13 @@ def preprocessing_data(cfg):
                         extra["object_name"].append(obj_name)
                         extra["action_name"].append(action_name)
                         extra["nframes"].append(ef - sf)
-                        # subject/labels are only consumed by the full_motion
-                        # (whole-sequence) viewer path; keep the columns aligned
-                        # for the clip path with the subject and no intervals.
+                        # subject/labels/grasps are only consumed by the
+                        # full_motion (whole-sequence) viewer path; keep the
+                        # columns aligned for the clip path with the subject and
+                        # no intervals.
                         extra["subject"].append(subj)
                         extra["labels"].append([])
+                        extra["grasps"].append({"left": [], "right": []})
 
     final_dict = align_frame({k: lists[k] for k in [
         "x_lhand", "x_rhand", "j_lhand", "j_rhand",
@@ -462,6 +516,7 @@ def preprocessing_data(cfg):
         "lcf_idx", "lcov_idx", "lchj_idx", "ldist_value",
         "rcf_idx", "rcov_idx", "rchj_idx", "rdist_value",
         "labels",  # per-row list of interval dicts (variable length)
+        "grasps",  # per-row {"left": [[s,e],...], "right": [[s,e],...]}
     }
 
     def _to_array(key, value):

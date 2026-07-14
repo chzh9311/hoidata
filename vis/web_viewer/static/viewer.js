@@ -11,9 +11,14 @@ const seqLabel = document.getElementById('seqLabel');
 const playBtn = document.getElementById('playBtn');
 const frameReadout = document.getElementById('frameReadout');
 const scrub = document.getElementById('scrub');
-const segTrack = document.getElementById('segTrack');
-const playhead = document.getElementById('playhead');
+const segAction = document.getElementById('segAction');
+const segLeft = document.getElementById('segLeft');
+const segRight = document.getElementById('segRight');
+const playheadLine = document.querySelector('#playhead .line');
 const activeLabelEl = document.getElementById('activeLabel');
+
+// Stable-grasp block colors (match the legend + hand-side convention).
+const GRASP_COLORS = { left: [0.20, 0.45, 0.95], right: [0.90, 0.25, 0.25] };
 
 const FPS = window.__FPS__ || 30;
 
@@ -61,8 +66,9 @@ let loading = false;
 // Annotation state for the loaded sequence.
 let labels = [];              // [{start, end, hand, action}]
 let labelColors = {};          // {left|right|both -> [r,g,b] 0..1}
+let grasps = { left: [], right: [] };  // stable-grasp intervals per side
 let activeLabelIdx = -1;       // which label is highlighted right now (-1 none)
-let segEls = [];               // DOM nodes for each label's colored block
+let segEls = [];               // DOM nodes for each action label's colored block
 
 function clearMeshes() {
   for (const m of meshes) {
@@ -100,6 +106,7 @@ function buildScene(meta, buffer) {
   nframes = meta.nframes;
   labels = meta.labels || [];
   labelColors = meta.label_colors || {};
+  grasps = meta.grasps || { left: [], right: [] };
   activeLabelIdx = -1;
 
   const arrays = meta.arrays;
@@ -127,7 +134,7 @@ function buildScene(meta, buffer) {
     });
   }
 
-  renderLabelTrack();
+  renderTracks();
   frameSceneToBBox();
   setFrame(0);
 }
@@ -136,38 +143,56 @@ function rgbCss(c) {
   return `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
 }
 
-// Build the segmented bar: one solid colored block per labelled interval,
-// positioned by frame fraction, showing the action text (image-style).
-function renderLabelTrack() {
-  segTrack.innerHTML = '';
-  segEls = [];
-  if (nframes <= 0) return;
-  const span = nframes;   // fraction of the full frame count [0, nframes)
-  for (const lab of labels) {
-    const seg = document.createElement('div');
-    seg.className = 'seg';
-    const left = (lab.start / span) * 100;
-    const width = Math.max(((lab.end - lab.start) / span) * 100, 0.4);
-    const c = labelColors[lab.hand] || [0.6, 0.6, 0.6];
-    seg.style.left = left + '%';
-    seg.style.width = width + '%';
-    seg.style.background = rgbCss(c);
-    seg.title = `${lab.start}-${lab.end}  ${lab.action} (${lab.hand})`;
-
+// Build one colored block for an interval within a track lane, positioned by
+// frame fraction over the full sequence. Returns the DOM node.
+function makeSegment(start, end, color, text, tooltip) {
+  const seg = document.createElement('div');
+  seg.className = 'seg';
+  seg.style.left = (start / nframes) * 100 + '%';
+  seg.style.width = Math.max(((end - start) / nframes) * 100, 0.4) + '%';
+  seg.style.background = rgbCss(color);
+  if (tooltip) seg.title = tooltip;
+  if (text) {
     const txt = document.createElement('span');
     txt.className = 'segtext';
-    txt.textContent = lab.action || '';
+    txt.textContent = text;
     seg.appendChild(txt);
+  }
+  return seg;
+}
 
-    segTrack.appendChild(seg);
+// Fill all three tracks: action labels (with text), left-hand stable grasps,
+// and right-hand stable grasps (colored blocks, no text).
+function renderTracks() {
+  segAction.innerHTML = '';
+  segLeft.innerHTML = '';
+  segRight.innerHTML = '';
+  segEls = [];
+  if (nframes <= 0) return;
+
+  // Top track: action labels (kept as the highlightable segEls for meshes).
+  for (const lab of labels) {
+    const c = labelColors[lab.hand] || [0.6, 0.6, 0.6];
+    const seg = makeSegment(lab.start, lab.end, c, lab.action || '',
+      `${lab.start}-${lab.end}  ${lab.action} (${lab.hand})`);
+    segAction.appendChild(seg);
     segEls.push(seg);
+  }
+
+  // Middle / bottom tracks: stable grasps per side (no text).
+  for (const [side, container] of [['left', segLeft], ['right', segRight]]) {
+    const c = GRASP_COLORS[side];
+    for (const [s, e] of (grasps[side] || [])) {
+      container.appendChild(
+        makeSegment(s, e, c, '', `${side} grasp  ${s}-${e}`));
+    }
   }
 }
 
-// Move the playhead line to frame t's horizontal position.
+// Move the playhead line to frame t's horizontal position within the lanes.
 function updatePlayhead(t) {
   const frac = nframes > 1 ? t / (nframes - 1) : 0;
-  playhead.style.left = (frac * 100) + '%';
+  playheadLine.style.left = (frac * 100) + '%';
 }
 
 // The label whose interval contains frame t (last one wins on overlap), or -1.
@@ -268,7 +293,9 @@ function animate(now) {
 
 function setPlaying(p) {
   playing = p;
-  playBtn.textContent = p ? 'Pause' : 'Play';
+  // YouTube-style glyphs: ⏸ while playing, ▶ (triangle) while paused.
+  playBtn.textContent = p ? '⏸' : '▶';
+  playBtn.title = p ? 'Pause (space)' : 'Play (space)';
 }
 
 // ---------------------------------------------------------------- data loading
@@ -298,13 +325,26 @@ async function loadSequence(index) {
 // ---------------------------------------------------------------- UI wiring
 playBtn.addEventListener('click', () => setPlaying(!playing));
 
+// Spacebar toggles play/pause (unless typing in the sequence dropdown, whose
+// own keyboard behaviour we leave alone).
+window.addEventListener('keydown', (e) => {
+  if (e.code !== 'Space' && e.key !== ' ') return;
+  if (document.activeElement === seqSelect) return;
+  e.preventDefault();           // stop the page from scrolling
+  if (nframes > 0) setPlaying(!playing);
+});
+
 // Scrubbing on the custom segmented bar: click or drag to seek. Playback pauses
 // while dragging and resumes on release if it was playing.
 let scrubbing = false;
 let wasPlayingBeforeScrub = false;
 
 function frameFromEvent(e) {
-  const rect = scrub.getBoundingClientRect();
+  // Measure against a lane's geometry (segAction fills the lane via inset:0),
+  // NOT the whole #scrub box — #scrub includes the left track-name gutter, while
+  // the segments and playhead live only within the lane. Using #scrub here would
+  // offset the mapping by the gutter width and mis-track the pointer.
+  const rect = segAction.getBoundingClientRect();
   let frac = (e.clientX - rect.left) / rect.width;
   frac = Math.max(0, Math.min(1, frac));
   return Math.round(frac * Math.max(nframes - 1, 0));
