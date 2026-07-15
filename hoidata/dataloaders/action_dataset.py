@@ -28,9 +28,9 @@ import lightning as L
 import torch
 import pickle
 
-from utils.frame import get_valid_mask
-from utils.proc import get_contact_map, process_dist_map, transform_xdata_to_joints
-from utils.rot import rot6d_to_rotmat, rotmat_to_rot6d
+from hoidata.utils.frame import get_valid_mask
+from hoidata.utils.proc import get_contact_map, process_dist_map, transform_xdata_to_joints
+from hoidata.utils.rot import rot6d_to_rotmat, rotmat_to_rot6d
 
 
 def _seed_worker(worker_id):
@@ -328,7 +328,7 @@ class MotionDatasetBase(Dataset):
         trajectory is delegated to ``_obj_traj_from_xobj`` (rigid for GRAB,
         articulated for ARCTIC).
         """
-        from utils.proc import transform_xdata_to_verts, transform_xdata_to_joints
+        from hoidata.utils.proc import transform_xdata_to_verts, transform_xdata_to_joints
 
         nframes = int(self.nframes[index])
         is_lhand = self.is_lhand[index]

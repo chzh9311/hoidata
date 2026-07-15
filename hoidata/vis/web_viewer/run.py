@@ -30,7 +30,7 @@ import numpy as np
 from flask import Flask, Response, jsonify, render_template
 from omegaconf import OmegaConf
 
-from vis.o3d_visualizer import build_dataset, pose_sample
+from hoidata.vis.o3d_visualizer import build_dataset, pose_sample
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
 OBJECT_COLOR = [0.6, 0.7, 0.9]
@@ -59,12 +59,17 @@ STATE = {
 
 
 def _build_sequence_list(ds):
-    """Cheap per-index metadata for the dropdown — no MANO/GPU posing."""
+    """Cheap per-index metadata for the dropdown — no MANO/GPU posing.
+
+    Uses the ``_object_name`` hook (uniform across GRAB/ARCTIC) rather than a
+    dataset-specific attribute: ARCTIC stores ``object_name`` while GRAB stores
+    ``obj_name``, but both expose ``_object_name(index)``.
+    """
     seqs = []
     for i in range(len(ds)):
         seqs.append({
             "index": i,
-            "obj_name": str(ds.object_name[i]),
+            "obj_name": str(ds._object_name(i)),
             "action_name": str(ds.action_name[i]),
             "nframes": int(ds.nframes[i]),
         })

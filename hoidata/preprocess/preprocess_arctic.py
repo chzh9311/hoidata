@@ -45,11 +45,11 @@ import torch
 import tqdm
 import trimesh
 
-from utils.hand_proc import ManoLayerWrapper
-from dataloaders.action_dataset import ObjectModel
-from utils.object_tensors import ObjectTensors
-from utils.frame import align_frame
-from utils.proc import (
+from hoidata.utils.hand_proc import ManoLayerWrapper
+from hoidata.dataloaders.action_dataset import ObjectModel
+from hoidata.utils.object_tensors import ObjectTensors
+from hoidata.utils.frame import align_frame
+from hoidata.utils.proc import (
     farthest_point_sample,
     proc_numpy,
     proc_torch_cuda,
@@ -57,15 +57,15 @@ from utils.proc import (
     transform_obj_to_xdata,
     transform_xdata_to_joints,
 )
-from utils.proc_arctic import (
+from hoidata.utils.proc_arctic import (
     get_contact_info_arctic,
     process_hand_keypoints,
     process_object,
     process_text,
     processe_params,
 )
-from utils.rot import axis_angle_to_rotmat
-from constants.arctic_constants import (
+from hoidata.utils.rot import axis_angle_to_rotmat
+from hoidata.constants.arctic_constants import (
     arctic_obj_name,
     subj_list,
     not_save_list,
@@ -624,7 +624,7 @@ def print_text_data_num(cfg):
 
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="arctic")
+@hydra.main(version_base=None, config_path="../../configs", config_name="arctic")
 def main(cfg):
     preprocessing_object(cfg)
     preprocessing_data(cfg)

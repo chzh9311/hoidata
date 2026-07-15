@@ -14,8 +14,8 @@ from scipy.spatial.distance import cdist
 
 sys.path = [".."] + sys.path
 
-from utils.proc import thing2dev, pad_tensor_list
-from utils.rot import axis_angle_to_quaternion, quaternion_apply
+from hoidata.utils.proc import thing2dev, pad_tensor_list
+from hoidata.utils.rot import axis_angle_to_quaternion, quaternion_apply
 
 
 class xdict(dict):

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hoi-data-analyzer"
+version = "0.1.0"
+description = "Base classes for loading single-frame and sequence hand-object-interaction (HOI) motion data."
+requires-python = ">=3.10"
+dynamic = []
+
+[tool.setuptools]
+packages = [
+    "hoidata",
+    "hoidata.constants",
+    "hoidata.dataloaders",
+    "hoidata.preprocess",
+    "hoidata.utils",
+    "hoidata.vis",
+    "hoidata.vis.web_viewer",
+]
+
+[tool.setuptools.package-data]
+"hoidata.vis.web_viewer" = ["static/**/*", "templates/**/*"]

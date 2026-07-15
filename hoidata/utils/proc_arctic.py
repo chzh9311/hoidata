@@ -16,7 +16,7 @@ All hand-layer calls below use the convention of *this* repo.
 import numpy as np
 import torch
 
-from utils.proc import (
+from hoidata.utils.proc import (
     proc_numpy,
     proc_torch_cuda,
     proc_torch_frame,

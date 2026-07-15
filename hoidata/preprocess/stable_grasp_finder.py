@@ -1,4 +1,4 @@
-"""Find stable grasp regions in ARCTIC sequences.
+"""Find stable grasp regions in ARCTIC or GRAB sequences.
 
 Ported (minimally) from Get A Grip
 (``code_arctic/stable_grasps_finder.py``), keeping only what is needed to *find*
@@ -12,24 +12,31 @@ Contact is defined by the signed hand-to-object mesh distance being below
 ``contact_thr`` (0 = object vertex has penetrated inside the hand surface).
 
 Rather than re-porting the original ego-camera reader, this reuses the repo's own
-ARCTIC sequence reader (``vis/o3d_visualizer.build_dataset`` + ``pose_sample``),
-which already yields per-frame world-space hand/object vertices and faces. The IoU
-and object-to-hand relative-rotation metrics are invariant to the choice of a
-consistent per-frame rigid space, so world-space vertices give the same segments as
-the original ego-space ones.
+sequence reader (``vis/o3d_visualizer.build_dataset`` + ``pose_sample``), which
+already yields per-frame world-space hand/object vertices and faces for both
+ARCTIC and GRAB (dispatched on ``cfg.name``). The IoU and object-to-hand
+relative-rotation metrics are invariant to the choice of a consistent per-frame
+rigid space, so world-space vertices give the same segments as the original
+ego-space ones.
 
-Output CSV schema (consumed by ``preprocess_arctic.load_stable_grasps``):
+Output CSV schema (consumed by ``preprocess_{arctic,grab}.load_stable_grasps``):
     sid_seq_name, side, start, end, angle_diff
-where ``sid_seq_name = f"{subject}/{action_name}"`` (e.g. ``s01/box_grab_01``),
-``side`` is ``left``/``right``, ``[start, end)`` are 0-indexed frame bounds, and
-``angle_diff`` is the max object-to-hand relative rotation (deg) over the segment.
+where ``sid_seq_name = f"{subject}/{seq_name}"`` (e.g. ``s01/box_grab_01`` for
+ARCTIC, ``s1/airplane_lift`` for GRAB), ``side`` is ``left``/``right``,
+``[start, end)`` are 0-indexed frame bounds, and ``angle_diff`` is the max
+object-to-hand relative rotation (deg) over the segment. The subject is ARCTIC's
+``subject`` field, or GRAB's ``sbj_id`` (e.g. ``s1``); the seq_name is ARCTIC's
+``action_name`` (already the sequence filename) or GRAB's ``seq_name`` (the raw
+filename without extension — unique, unlike GRAB's motion-intent action_name).
 
-Run (in the ``hoi_common`` conda env, CUDA 12.4):
-    python -m preprocess.stable_grasp_finder
+Run (in the ``hoi_common`` conda env, CUDA 12.4). The dataset is selected by the
+hydra ``config_name`` — ``arctic`` (default) or ``grab``:
+    python -m preprocess.stable_grasp_finder                       # ARCTIC
+    python -m preprocess.stable_grasp_finder --config-name grab    # GRAB
     python -m preprocess.stable_grasp_finder stable_grasp_out_csv=/path/out.csv \
         stable_grasp_iou_thr=-0.5 stable_grasp_frag_ratio=0.01
-Data locations (``data_path`` etc.) come from ``configs/arctic.yaml`` and can be
-overridden on the command line via hydra.
+Data locations (``data_path`` etc.) come from the selected ``configs/<name>.yaml``
+and can be overridden on the command line via hydra.
 """
 
 import os
@@ -44,9 +51,9 @@ from pytorch3d.ops import knn_gather, knn_points
 from pytorch3d.transforms import so3_rotation_angle
 import torch.nn.functional as F
 
-from utils.proc import proc_numpy, proc_torch_cuda
-from utils.rot import axis_angle_to_rotmat, rot6d_to_rotmat
-from vis.o3d_visualizer import build_dataset, pose_sample
+from hoidata.utils.proc import proc_numpy, proc_torch_cuda
+from hoidata.utils.rot import axis_angle_to_rotmat, rot6d_to_rotmat
+from hoidata.vis.o3d_visualizer import build_dataset, pose_sample
 
 LEFT = "left"
 RIGHT = "right"
@@ -455,6 +462,14 @@ def _sequence_global_rotmats(ds, index, item, device="cuda"):
     Hand global rotation comes from the stored x-data (trans + rot6d, first 6 pose
     dims after translation) for whichever hands are active.
 
+    These rotations feed *only* the reported ``angle_diff`` metadata column (the
+    max object-to-hand relative rotation over a segment); they do not affect
+    segment boundaries, which come purely from contact-area IoU on world-space
+    verts. Note GRAB's ``_obj_traj_from_xobj`` negates the object rotvec (returns
+    R^{-1}) while the hand rot6d is not negated, so GRAB's ``angle_diff`` uses a
+    different object-rotation sign convention than ARCTIC's — fine for a relative
+    magnitude used only to tag/inspect segments.
+
     Returns:
         obj_rotmat: (T, 3, 3) cuda tensor
         hand_rotmat: {side: (T, 3, 3) cuda tensor} for active hands only
@@ -475,10 +490,35 @@ def _sequence_global_rotmats(ds, index, item, device="cuda"):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _sample_subject(sample, ds, index):
+    """Subject id for the CSV: ARCTIC's ``subject`` or GRAB's ``sbj_id`` (e.g. s1)."""
+    subject = sample.get("subject", "")
+    if not subject and getattr(ds, "sbj_id", None) is not None:
+        subject = str(ds.sbj_id[index])
+    return subject
+
+
+def _sample_seq_name(sample, ds, index):
+    """Unique per-sequence name for the CSV.
+
+    ARCTIC's ``action_name`` is already the sequence filename (e.g.
+    ``box_grab_01``), so it is unique.  GRAB's ``action_name`` is the motion
+    intent (e.g. ``lift``), shared across objects/subjects, so prefer GRAB's
+    ``seq_name`` (the full raw filename without extension, e.g. ``airplane_lift``)
+    when present.
+    """
+    if getattr(ds, "seq_name", None) is not None:
+        return str(ds.seq_name[index])
+    return sample["action_name"]
+
+
 def find_all_stable_grasp(cfg, out_csv, iou_thr, frag_ratio,
                           contact_thr=0.0, min_len=10, along_normal=True,
-                          splits=("train", "val", "test")):
-    """Find stable grasp segments for every ARCTIC sequence and write a CSV.
+                          dataset_name="arctic", splits=("train", "val", "test")):
+    """Find stable grasp segments for every sequence of a dataset and write a CSV.
+
+    Works for both ARCTIC and GRAB (selected by ``dataset_name``); the repo's
+    reader poses each dataset's objects (articulated / rigid) transparently.
 
     The four criteria knobs below trade strictness for coverage. To loosen the
     criteria (find more / longer intervals): raise ``iou_thr`` toward 0, raise
@@ -498,14 +538,15 @@ def find_all_stable_grasp(cfg, out_csv, iou_thr, frag_ratio,
         min_len: segments shorter than this many frames are dropped.
         along_normal: measure the hand→object distance along the surface normal
             (vs. raw signed magnitude).
-        splits: dataset splits to cover. ARCTIC splits partition by object, so the
-            default (all three) covers every sequence.
+        dataset_name: "arctic" or "grab"; dispatches the object-posing path.
+        splits: dataset splits to cover. Both ARCTIC and GRAB splits partition by
+            object, so the default (all three) covers every sequence.
     """
     rows = []
     for split in splits:
-        ds, lhand_layer, rhand_layer = build_dataset(cfg, "arctic", split)
-        for index in tqdm.tqdm(range(len(ds)), desc=f"arctic/{split}"):
-            sample = pose_sample(cfg, "arctic", ds, lhand_layer, rhand_layer, index)
+        ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, split)
+        for index in tqdm.tqdm(range(len(ds)), desc=f"{dataset_name}/{split}"):
+            sample = pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index)
             item = ds[index]
             obj_rotmat, hand_rotmat = _sequence_global_rotmats(ds, index, item)
 
@@ -515,7 +556,9 @@ def find_all_stable_grasp(cfg, out_csv, iou_thr, frag_ratio,
                 contact_thr=contact_thr, min_len=min_len,
                 along_normal=along_normal)
 
-            sid_seq_name = f'{sample["subject"]}/{sample["action_name"]}'
+            subject = _sample_subject(sample, ds, index)
+            seq_name = _sample_seq_name(sample, ds, index)
+            sid_seq_name = f'{subject}/{seq_name}'
             for side, s, e, angle_diff in segments:
                 rows.append([sid_seq_name, side, s, e, angle_diff])
 
@@ -526,13 +569,15 @@ def find_all_stable_grasp(cfg, out_csv, iou_thr, frag_ratio,
     print(f"Saved {len(df)} stable-grasp segments → {out_csv}")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="arctic")
+@hydra.main(version_base=None, config_path="../../configs", config_name="arctic")
 def main(cfg):
+    # Dataset is selected by the hydra config_name (arctic | grab):
+    #   python -m preprocess.stable_grasp_finder --config-name grab
     # All criteria knobs are hydra-overridable, e.g. to loosen the criteria:
     #   python -m preprocess.stable_grasp_finder \
     #       stable_grasp_iou_thr=-0.35 stable_grasp_contact_thr=0.005 \
     #       stable_grasp_min_len=5 stable_grasp_out_csv=/path/out.csv
-    out_csv = cfg.get("stable_grasp_out_csv", cfg.stable_grasp_csv)
+    out_csv = cfg.get("stable_grasp_out_csv", cfg.get("stable_grasp_csv"))
     iou_thr = float(cfg.get("stable_grasp_iou_thr", -0.50))
     frag_ratio = float(cfg.get("stable_grasp_frag_ratio", 0.01))
     contact_thr = float(cfg.get("stable_grasp_contact_thr", 0.0))
@@ -540,7 +585,8 @@ def main(cfg):
     along_normal = bool(cfg.get("stable_grasp_along_normal", True))
     find_all_stable_grasp(
         cfg, out_csv=out_csv, iou_thr=iou_thr, frag_ratio=frag_ratio,
-        contact_thr=contact_thr, min_len=min_len, along_normal=along_normal)
+        contact_thr=contact_thr, min_len=min_len, along_normal=along_normal,
+        dataset_name=cfg.name)
 
 
 if __name__ == "__main__":

@@ -3,4 +3,5 @@ data/**
 **.mp4
 **/__pycache__/**
 outputs/**
-preprocess/output/**
+hoidata/preprocess/output/**
+*.egg-info/

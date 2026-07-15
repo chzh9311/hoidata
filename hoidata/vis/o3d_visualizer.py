@@ -14,13 +14,13 @@ import trimesh
 import open3d as o3d
 from omegaconf import OmegaConf
 
-from dataloaders.action_dataset import ObjectModel
-from dataloaders.grab_dataset import MotionGRAB
-from dataloaders.arctic_dataset import MotionARCTIC
-from utils.hand_proc import ManoLayerWrapper
-from utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
-from utils.proc_arctic import process_object
-from utils.object_tensors import ObjectTensors
+from hoidata.dataloaders.action_dataset import ObjectModel
+from hoidata.dataloaders.grab_dataset import MotionGRAB
+from hoidata.dataloaders.arctic_dataset import MotionARCTIC
+from hoidata.utils.hand_proc import ManoLayerWrapper
+from hoidata.utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
+from hoidata.utils.proc_arctic import process_object
+from hoidata.utils.object_tensors import ObjectTensors
 
 
 HAND_SIDE_COLORS = {"left": (0.9, 0.75, 0.65), "right": (0.75, 0.85, 0.95)}

@@ -10,8 +10,8 @@ import os.path as osp
 import numpy as np
 
 from .action_dataset import MotionDatasetBase, MotionDataModuleBase
-from utils.proc import pc_normalize, proc_numpy, proc_torch_cuda, process_text
-from constants.grab_constants import grab_val_obj_name, grab_test_obj_name, grab_obj_name
+from hoidata.utils.proc import pc_normalize, proc_numpy, proc_torch_cuda, process_text
+from hoidata.constants.grab_constants import grab_val_obj_name, grab_test_obj_name, grab_obj_name
 
 
 class MotionGRAB(MotionDatasetBase):
@@ -57,6 +57,12 @@ class MotionGRAB(MotionDatasetBase):
             self.action_name   = data["action_name"][mask]
             self.nframes       = data["nframes"][mask]
             self.sbj_id        = data["sbj_id"][mask] if "sbj_id" in data else None
+            # Full raw filename (no ext) per sequence — unique, unlike action_name
+            # (the motion intent).  Used to build a distinguishable stable-grasp key.
+            self.seq_name      = data["seq_name"][mask] if "seq_name" in data else None
+            # Optional stable-grasp intervals (present only when the CSV was wired
+            # into preprocessing); consumed by the web viewer's grasp tracks.
+            self.grasps        = data["grasps"][mask] if "grasps" in data else None
             # contact attributes not needed for the physics metrics
             self.lcf_idx = self.lcov_idx = self.lchj_idx = self.ldist_value = None
             self.rcf_idx = self.rcov_idx = self.rchj_idx = self.rdist_value = None
@@ -122,7 +128,7 @@ class MotionGRAB(MotionDatasetBase):
 
     def _obj_traj_from_xobj(self, x_obj, nframes):
         # x_obj is (T, 9) = trans(3) + rot6d(6) → trans + rotvec.
-        from utils.rot import rot6d_to_axis_angle
+        from hoidata.utils.rot import rot6d_to_axis_angle
         obj_trans = x_obj[:, :3]
         obj_rotvec = proc_numpy(
             rot6d_to_axis_angle(proc_torch_cuda(x_obj[:, 3:]))
@@ -150,7 +156,7 @@ class MotionGRABDataModule(MotionDataModuleBase):
         # default layers when unavailable.
         subject_meshes_root = cfg.get('subject_meshes_root', None)
         if subject_meshes_root is not None and osp.isdir(subject_meshes_root):
-            from utils.mano_subject import SubjectManoLayers
+            from hoidata.utils.mano_subject import SubjectManoLayers
             device = getattr(lhand_layer, 'th_v_template', None)
             device = device.device if device is not None else None
             self.subject_layers = SubjectManoLayers(

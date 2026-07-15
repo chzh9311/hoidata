@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from pytorch3d.ops.knn import knn_points
 
-from utils.rot import (
+from hoidata.utils.rot import (
     axis_angle_to_rot6d,
     rotmat_to_rot6d,
     rot6d_to_rotmat,
@@ -103,7 +103,7 @@ def transform_xdata_to_joints(xdata, hand_layer):
 
 def transform_xdata_to_verts(xdata, hand_layer):
     """Convert x-data (trans + rot6d) to (T, 778, 3) world-space MANO vertices."""
-    from utils.rot import rot6d_to_axis_angle
+    from hoidata.utils.rot import rot6d_to_axis_angle
     xdata = proc_torch_cuda(xdata)
     nframes = xdata.shape[0]
     pred_trans = xdata[:, :3]
@@ -168,7 +168,7 @@ def _get_hand_joints_w_tip(hand_params, hand_layer):
     pred_trans = hand_params[..., :3]
     pred_rot6d = hand_params[..., 3:]
 
-    from utils.rot import rot6d_to_axis_angle
+    from hoidata.utils.rot import rot6d_to_axis_angle
     pred_pose = rot6d_to_axis_angle(pred_rot6d.reshape(-1, 6)).reshape(-1, 48)
     pred_trans_flat = pred_trans.reshape(-1, 3)
     betas = torch.zeros(bs * nframes, 10, device=hand_params.device)

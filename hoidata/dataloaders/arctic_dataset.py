@@ -12,8 +12,8 @@ by a 1-DoF revolute joint, so the object x-data is **10-D**:
 import numpy as np
 
 from .action_dataset import MotionDatasetBase, MotionDataModuleBase, compute_xdata_delta
-from utils.proc import pc_normalize, proc_numpy, proc_torch_cuda, process_text
-from constants.arctic_constants import (
+from hoidata.utils.proc import pc_normalize, proc_numpy, proc_torch_cuda, process_text
+from hoidata.constants.arctic_constants import (
     arctic_obj_name, arctic_val_obj_name, arctic_test_obj_name,
 )
 
@@ -138,7 +138,7 @@ class MotionARCTIC(MotionDatasetBase):
         GRAB, the rotvec is **not** negated — the ARCTIC articulation/posing path
         (``process_obj_result``) applies R directly (no transpose) on the raw rotvec.
         """
-        from utils.rot import rot6d_to_axis_angle
+        from hoidata.utils.rot import rot6d_to_axis_angle
         obj_trans = x_obj[:, :3]
         obj_rotvec = proc_numpy(
             rot6d_to_axis_angle(proc_torch_cuda(x_obj[:, 3:9]))

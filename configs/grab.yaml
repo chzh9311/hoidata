@@ -1,0 +1,28 @@
+name: "grab"
+root: "data/grab_raw/grab"                     # raw GRAB sequences: s{1..10}/*.npz
+obj_root: "data/grab_raw/tools/object_meshes/contact_meshes"  # object .ply meshes
+data_path: "data/output/grab/data.npz"
+data_obj_pc_path: "data/output/grab/obj.pkl"
+balance_weights_path: "data/output/grab/balance_weights.pkl"
+text_json: "data/output/grab/text.json"
+t2l_json: "data/output/grab/text_length.json"
+t2c_json: "data/output/grab/text_count.json"
+stable_grasp_csv: "data/output/grab/stable_grasps.csv"
+# Stable-grasp finder (preprocess/stable_grasp_finder.py) parameters.
+# Loosen the criteria to identify more / longer stable intervals:
+# raise iou_thr toward 0, raise contact_thr to a small positive value, lower min_len.
+stable_grasp_out_csv: "data/output/grab/stable_grasps.csv"  # output CSV path
+stable_grasp_iou_thr: -0.40        # negative; -iou_thr = min pairwise contact-area IoU
+stable_grasp_frag_ratio: 0.01      # object-vertex fragmentation ratio in (0, 1]
+stable_grasp_contact_thr: 0.0045   # signed hand->object dist (m) below which a vert is in contact
+stable_grasp_min_len: 10           # drop segments shorter than this many frames
+stable_grasp_along_normal: True    # measure hand->object distance along the surface normal
+mano_root: "/home/zxc417/data/mano_v1_2/models"
+flat_hand: True
+use_pca: False
+full_motion: False
+max_nframes: 150
+data_ratio: 1
+augm: False
+data_num: 1335
+text_num: 276
