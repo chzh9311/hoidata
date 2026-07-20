@@ -160,3 +160,12 @@ class MotionARCTICDataModule(MotionDataModuleBase):
     """LightningDataModule wrapping MotionARCTIC (no per-subject MANO layers)."""
 
     dataset_cls = MotionARCTIC
+
+    def prepare_data(self):
+        """Run any missing ARCTIC preprocessing steps before setup.
+
+        Detects each preprocessed file independently and only regenerates the
+        missing ones (see ``_run_missing_preprocessing``).
+        """
+        from hoidata.preprocess import preprocess_arctic
+        self._run_missing_preprocessing(preprocess_arctic)

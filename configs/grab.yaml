@@ -17,6 +17,10 @@ stable_grasp_frag_ratio: 0.01      # object-vertex fragmentation ratio in (0, 1]
 stable_grasp_contact_thr: 0.0045   # signed hand->object dist (m) below which a vert is in contact
 stable_grasp_min_len: 10           # drop segments shorter than this many frames
 stable_grasp_along_normal: True    # measure hand->object distance along the surface normal
+# TransitionMotionGRAB — transition-motion windows derived from stable grasps.
+transition_min_len: 10    # discard transition windows shorter than this many frames
+transition_max_len: 100   # clip / split threshold (max transition-window length in frames)
+aug_p: 0.5
 mano_root: "/home/zxc417/data/mano_v1_2/models"
 flat_hand: True
 use_pca: False

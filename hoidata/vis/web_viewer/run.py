@@ -30,7 +30,8 @@ import numpy as np
 from flask import Flask, Response, jsonify, render_template
 from omegaconf import OmegaConf
 
-from hoidata.vis.o3d_visualizer import build_dataset, pose_sample
+from hoidata.vis.o3d_visualizer import (
+    build_dataset, pose_sample, build_transition_dataset, pose_transition_sample)
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
 OBJECT_COLOR = [0.6, 0.7, 0.9]
@@ -55,24 +56,37 @@ STATE = {
     "sequences": [],   # list of {index, obj_name, action_name, nframes}
     "cache": {},        # index -> (meta_dict, bytes)
     "fps": 30,
+    "transition": False,  # True → GRAB transition-motion dataset
 }
 
 
-def _build_sequence_list(ds):
+def _build_sequence_list(ds, transition=False):
     """Cheap per-index metadata for the dropdown — no MANO/GPU posing.
 
     Uses the ``_object_name`` hook (uniform across GRAB/ARCTIC) rather than a
     dataset-specific attribute: ARCTIC stores ``object_name`` while GRAB stores
     ``obj_name``, but both expose ``_object_name(index)``.
+
+    For the transition dataset each index is a *transition* (not a sequence), so
+    per-transition helpers (``transition_label`` / ``transition_nframes``) supply
+    the label and length.
     """
     seqs = []
     for i in range(len(ds)):
-        seqs.append({
-            "index": i,
-            "obj_name": str(ds._object_name(i)),
-            "action_name": str(ds.action_name[i]),
-            "nframes": int(ds.nframes[i]),
-        })
+        if transition:
+            seqs.append({
+                "index": i,
+                "obj_name": str(ds._object_name(i)),
+                "action_name": ds.transition_label(i),
+                "nframes": int(ds.transition_nframes(i)),
+            })
+        else:
+            seqs.append({
+                "index": i,
+                "obj_name": str(ds._object_name(i)),
+                "action_name": str(ds.action_name[i]),
+                "nframes": int(ds.nframes[i]),
+            })
     return seqs
 
 
@@ -152,10 +166,16 @@ def _get_sequence_payload(index):
     """Return (meta, blob) for a sequence, posing + caching on first request."""
     if index in STATE["cache"]:
         return STATE["cache"][index]
-    sample = pose_sample(
-        STATE["cfg"], STATE["dataset_name"], STATE["ds"],
-        STATE["lhand_layer"], STATE["rhand_layer"], index,
-    )
+    if STATE["transition"]:
+        sample = pose_transition_sample(
+            STATE["cfg"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    else:
+        sample = pose_sample(
+            STATE["cfg"], STATE["dataset_name"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
     payload = _serialize_sample(sample)
     STATE["cache"][index] = payload
     return payload
@@ -195,14 +215,30 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--transition", action="store_true",
+                        help="View GRAB transition motions (TransitionMotionGRAB) "
+                             "instead of full sequences.")
+    parser.add_argument("--aug-p", type=float, default=None,
+                        help="Override transition random-trim augmentation "
+                             "probability (default: config aug_p; 0 = raw windows). "
+                             "Only used with --transition.")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
     dataset_name = cfg.name
 
-    print(f"Building dataset ({dataset_name}, split={args.split}) ...")
-    ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
-    sequences = _build_sequence_list(ds)
+    if args.transition:
+        if dataset_name != "grab":
+            parser.error("--transition is only supported for the GRAB config.")
+        aug_p = args.aug_p if args.aug_p is not None else cfg.get("aug_p", 0.0)
+        print(f"Building GRAB transition dataset (split={args.split}, "
+              f"aug_p={aug_p}) ...")
+        ds, lhand_layer, rhand_layer = build_transition_dataset(
+            cfg, args.split, aug_p=aug_p)
+    else:
+        print(f"Building dataset ({dataset_name}, split={args.split}) ...")
+        ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
+    sequences = _build_sequence_list(ds, transition=args.transition)
 
     STATE.update({
         "cfg": cfg,
@@ -214,10 +250,12 @@ def main():
         "sequences": sequences,
         "cache": {},
         "fps": args.fps,
+        "transition": args.transition,
     })
 
-    print(f"Loaded {len(sequences)} sequences. Serving at "
-          f"http://{args.host}:{args.port}/  (sequences posed lazily on first view)")
+    kind = "transitions" if args.transition else "sequences"
+    print(f"Loaded {len(sequences)} {kind}. Serving at "
+          f"http://{args.host}:{args.port}/  ({kind} posed lazily on first view)")
     # threaded=False keeps GPU posing serialized (one CUDA context, no reentrancy).
     app.run(host=args.host, port=args.port, threaded=False, debug=False)
 

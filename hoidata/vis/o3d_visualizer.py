@@ -15,7 +15,7 @@ import open3d as o3d
 from omegaconf import OmegaConf
 
 from hoidata.dataloaders.action_dataset import ObjectModel
-from hoidata.dataloaders.grab_dataset import MotionGRAB
+from hoidata.dataloaders.grab_dataset import MotionGRAB, TransitionMotionGRAB
 from hoidata.dataloaders.arctic_dataset import MotionARCTIC
 from hoidata.utils.hand_proc import ManoLayerWrapper
 from hoidata.utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
@@ -155,6 +155,95 @@ def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0)
         "subject": item.get("subject", ""),
         # Stable-grasp intervals per side: {"left": [[s,e],...], "right": [...]}.
         "grasps": item.get("grasps", {"left": [], "right": []}),
+    }
+
+
+def build_transition_dataset(cfg, split: str = "test", aug_p=None):
+    """Build the MANO layers and a :class:`TransitionMotionGRAB` dataset.
+
+    Mirrors :func:`build_dataset` but constructs the transition dataset (indexed
+    per transition, not per sequence) with the config's transition window bounds.
+    ``aug_p`` overrides the config's ``aug_p`` (the random-trim augmentation
+    probability on "01"/"10" windows); pass ``0.0`` to view raw windows, or leave
+    ``None`` to use the config value so the viewer shows augmented windows.
+    Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+
+    if aug_p is None:
+        aug_p = cfg.get("aug_p", 0.0)
+
+    ds = TransitionMotionGRAB(
+        data_path=cfg.data_path,
+        data_obj_pc_path=cfg.data_obj_pc_path,
+        text_json=cfg.text_json,
+        max_nframes=-1,
+        task="evaluate",
+        split=split,
+        lhand_layer=lhand_layer,
+        rhand_layer=rhand_layer,
+        min_len=cfg.get("transition_min_len", 10),
+        max_len=cfg.get("transition_max_len", 100),
+        aug_p=aug_p,
+    )
+    return ds, lhand_layer, rhand_layer
+
+
+def pose_transition_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Pose one GRAB transition window from a :class:`TransitionMotionGRAB`.
+
+    Unlike :func:`pose_sample` (which re-poses the whole sequence's object off
+    ``ds.x_obj[index]``), a transition item already carries its own sliced
+    ``x_hand``/``x_obj`` windows, so both hand and object are posed directly from
+    the item.  Returns the same dict shape the viewer expects.
+    """
+    from hoidata.utils.proc import transform_xdata_to_verts
+
+    item = ds[index]
+    side = item["hand_sides"][0]
+    layer = lhand_layer if side == "left" else rhand_layer
+
+    # Hand: raw x-data window → world-space MANO vertices for the single hand.
+    hand_verts = transform_xdata_to_verts(item["x_hand"], layer).astype(np.float32)  # (Tt,778,3)
+
+    # Object: rigid GRAB mesh posed per frame from the sliced x_obj window.
+    _, _, _, obj_path = ObjectModel(cfg.data_obj_pc_path)(item["obj_name"])
+    mesh = trimesh.load(osp.join(cfg.obj_root, obj_path), process=False)
+    obj_verts_t = process_obj_result(
+        proc_torch_cuda(np.asarray(mesh.vertices, dtype=np.float32)),
+        proc_torch_cuda(item["x_obj"]),
+        "grab",
+    )
+    obj_verts = proc_numpy(obj_verts_t)
+    obj_faces = np.asarray(mesh.faces)
+
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    return {
+        "hand_verts": hand_verts,
+        "hand_faces": hand_faces,
+        "hand_sides": item["hand_sides"],
+        "obj_verts": obj_verts,
+        "obj_faces": obj_faces,
+        "nframes": item["nframes"],
+        "obj_name": item["obj_name"],
+        # Label carries object / hand / transition-type (see transition_label).
+        "action_name": ds.transition_label(index),
+        "labels": [],
+        "subject": "",
+        "grasps": {"left": [], "right": []},
     }
 
 

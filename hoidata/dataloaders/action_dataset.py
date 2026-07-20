@@ -20,6 +20,7 @@ MotionGRABDataModule`` imports keep working after the refactor.
 
 import time
 import json
+import os.path as osp
 
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -549,6 +550,60 @@ class MotionDataModuleBase(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.subject_layers = None  # GRAB subclass may populate this
+
+    def _run_missing_preprocessing(self, pp):
+        """Run only the preprocessing steps whose output files are missing.
+
+        ``pp`` is a preprocessing module (``hoidata.preprocess.preprocess_arctic``
+        or ``...preprocess_grab``), which must expose ``preprocessing_object``,
+        ``preprocessing_data``, ``preprocessing_text``,
+        ``preprocessing_balance_weights``, ``preprocessing_text2length`` and
+        ``print_text_data_num`` — all taking ``cfg``.
+
+        Each step is checked independently against the exact config output path(s)
+        it writes, so a partially-preprocessed dataset only fills in what is
+        missing.  The text / balance-weight / text-length steps are gated on
+        ``full_motion`` (matching each pipeline's ``main()``): in full-motion mode
+        the data has ``is_lhand=None`` and those steps do not apply.
+
+        Called from each subclass's ``prepare_data`` (Lightning runs it once,
+        rank-0 only, before ``setup``).
+        """
+        cfg = self.cfg
+        full_motion = bool(cfg.get("full_motion", False))
+
+        # (label, function, [required output paths]) — a step runs if ANY of its
+        # outputs is absent.  Order matters: later steps read earlier outputs.
+        steps = [
+            ("object mesh point clouds", pp.preprocessing_object,
+             [cfg.data_obj_pc_path]),
+            ("motion + contact data", pp.preprocessing_data,
+             [cfg.data_path]),
+        ]
+        if not full_motion:
+            steps += [
+                ("text descriptions", pp.preprocessing_text,
+                 [cfg.text_json]),
+                ("balance weights", pp.preprocessing_balance_weights,
+                 [cfg.balance_weights_path, cfg.t2c_json]),
+                ("text-to-length stats", pp.preprocessing_text2length,
+                 [cfg.t2l_json]),
+            ]
+
+        ran_any = False
+        for label, fn, out_paths in steps:
+            missing = [p for p in out_paths if not osp.exists(p)]
+            if missing:
+                print(f"[prepare_data] {label}: missing {missing} — running "
+                      f"{fn.__name__}()")
+                fn(cfg)
+                ran_any = True
+            else:
+                print(f"[prepare_data] {label}: found {out_paths} — skipping.")
+
+        if not full_motion and ran_any:
+            # Sanity-count print (cheap; only when something was (re)built).
+            pp.print_text_data_num(cfg)
 
     def _make_dataset(self, split: str) -> MotionDatasetBase:
         dc = self.cfg
