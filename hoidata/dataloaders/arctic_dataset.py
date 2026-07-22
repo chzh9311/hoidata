@@ -11,7 +11,9 @@ by a 1-DoF revolute joint, so the object x-data is **10-D**:
 
 import numpy as np
 
-from .action_dataset import MotionDatasetBase, MotionDataModuleBase, compute_xdata_delta
+from .action_dataset import (
+    MotionDatasetBase, MotionDataModuleBase, compute_xdata_delta,
+    StableGraspMotionDataset)
 from hoidata.utils.proc import pc_normalize, proc_numpy, proc_torch_cuda, process_text
 from hoidata.constants.arctic_constants import (
     arctic_obj_name, arctic_val_obj_name, arctic_test_obj_name,
@@ -169,3 +171,75 @@ class MotionARCTICDataModule(MotionDataModuleBase):
         """
         from hoidata.preprocess import preprocess_arctic
         self._run_missing_preprocessing(preprocess_arctic)
+
+
+class StableGraspARCTIC(StableGraspMotionDataset):
+    """ARCTIC stable-grasp clips — one item per stable-grasp CSV row.
+
+    CSV rows are keyed by ``{subject}/{action_name}`` (e.g. ``s01/box_grab_01``);
+    ``action_name`` is already the unique sequence filename for ARCTIC.  The
+    object x-data is the articulated 10-D ``trans(3) + rot6d(6) + angle(1)``,
+    assembled from the separately-stored ``x_obj`` and ``x_obj_angle``.
+    """
+
+    all_obj_name = arctic_obj_name
+    val_obj_name = arctic_val_obj_name
+    test_obj_name = arctic_test_obj_name
+
+    def _sg_split_mask(self, data, split):
+        split_objs = self._split_objs(split)
+        return np.array([n in split_objs for n in data["object_name"]])
+
+    def _sg_load_arrays(self, data, mask):
+        self.object_name = data["object_name"][mask]
+        self.x_lhand = data["x_lhand"][mask]
+        self.x_rhand = data["x_rhand"][mask]
+        self.x_obj = data["x_obj"][mask]
+        self.x_obj_angle = data["x_obj_angle"][mask]
+        self.action_name = data["action_name"][mask]
+        self.nframes = data["nframes"][mask]
+        self.is_lhand = data["is_lhand"][mask]
+        self.is_rhand = data["is_rhand"][mask]
+        self.subject = data["subject"][mask] if "subject" in data else None
+        if self.subject is None:
+            raise ValueError(
+                "ARCTIC data.npz lacks `subject`, needed to match CSV rows to "
+                "sequences — re-run preprocess_arctic.py with full_motion.")
+
+    def _sg_seq_key(self, seq_idx):
+        return (str(self.subject[seq_idx]), str(self.action_name[seq_idx]))
+
+    def _sg_obj_name(self, seq_idx):
+        return str(self.object_name[seq_idx])
+
+    def _sg_x_object(self, seq_idx, a, b):
+        """(T, 10) = trans(3) + rot6d(6) + articulation angle(1)."""
+        x_obj = np.asarray(self.x_obj[seq_idx][a:b], dtype=np.float32)
+        x_ang = np.asarray(self.x_obj_angle[seq_idx][a:b], dtype=np.float32)
+        return np.concatenate([x_obj, x_ang], axis=1)
+
+
+class StableGraspARCTICDataModule(MotionARCTICDataModule):
+    """LightningDataModule wrapping :class:`StableGraspARCTIC`.
+
+    Reuses ARCTIC's preprocessing / split machinery; the stable-grasp CSV path
+    comes from ``cfg.stable_grasp_csv``.
+    """
+
+    dataset_cls = StableGraspARCTIC
+
+    def _make_dataset(self, split: str):
+        dc = self.cfg
+        return self.dataset_cls(
+            data_path=dc.data_path,
+            data_obj_pc_path=dc.data_obj_pc_path,
+            text_json=dc.text_json,
+            max_nframes=-1,          # per-grasp clips; no windowing
+            data_ratio=dc.get("data_ratio", 1.0),
+            task=self.task,
+            split=split,
+            lhand_layer=self.lhand_layer,
+            rhand_layer=self.rhand_layer,
+            subject_layers=self.subject_layers,
+            stable_grasp_csv=dc.get("stable_grasp_csv"),
+        )

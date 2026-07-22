@@ -7,7 +7,8 @@ object hooks live here.
 
 import numpy as np
 
-from .action_dataset import MotionDatasetBase, MotionDataModuleBase
+from .action_dataset import (
+    MotionDatasetBase, MotionDataModuleBase, StableGraspMotionDataset)
 from hoidata.utils.proc import pc_normalize, proc_numpy, proc_torch_cuda, process_text
 from hoidata.constants.grab_constants import grab_val_obj_name, grab_test_obj_name, grab_obj_name
 
@@ -399,5 +400,71 @@ class TransitionMotionGRABDataModule(MotionGRABDataModule):
             min_len=dc.get("transition_min_len", 10),
             max_len=dc.get("transition_max_len", 100),
             aug_p=aug_p,
+        )
+
+
+class StableGraspGRAB(StableGraspMotionDataset):
+    """GRAB stable-grasp clips — one item per stable-grasp CSV row.
+
+    CSV rows are keyed by ``{sbj_id}/{seq_name}`` (e.g. ``s1/airplane_lift``);
+    the object x-data is rigid GRAB's 9-D ``trans(3) + rot6d(6)``.
+    """
+
+    all_obj_name = grab_obj_name
+    val_obj_name = grab_val_obj_name
+    test_obj_name = grab_test_obj_name
+
+    def _sg_split_mask(self, data, split):
+        # Same object-name split selection as MotionGRAB's evaluate branch.
+        split_objs = self._split_objs(split)
+        return np.array([n in split_objs for n in data["obj_name"]])
+
+    def _sg_load_arrays(self, data, mask):
+        self.obj_name = data["obj_name"][mask]
+        self.proc_obj_name = data["proc_obj_name"][mask]
+        self.x_lhand = data["x_lhand"][mask]
+        self.x_rhand = data["x_rhand"][mask]
+        self.x_obj = data["x_obj"][mask]
+        self.action_name = data["action_name"][mask]
+        self.nframes = data["nframes"][mask]
+        self.is_lhand = data["is_lhand"][mask]
+        self.is_rhand = data["is_rhand"][mask]
+        self.sbj_id = data["sbj_id"][mask] if "sbj_id" in data else None
+        self.seq_name = data["seq_name"][mask] if "seq_name" in data else None
+        if self.sbj_id is None or self.seq_name is None:
+            raise ValueError(
+                "GRAB data.npz lacks `sbj_id` / `seq_name`, needed to match CSV "
+                "rows to sequences — re-run preprocess_grab.py.")
+
+    def _sg_seq_key(self, seq_idx):
+        return (str(self.sbj_id[seq_idx]), str(self.seq_name[seq_idx]))
+
+    def _sg_obj_name(self, seq_idx):
+        return str(self.obj_name[seq_idx])
+
+
+class StableGraspGRABDataModule(MotionGRABDataModule):
+    """LightningDataModule wrapping :class:`StableGraspGRAB`.
+
+    Reuses GRAB's preprocessing / split machinery; the stable-grasp CSV path
+    comes from ``cfg.stable_grasp_csv``.
+    """
+
+    dataset_cls = StableGraspGRAB
+
+    def _make_dataset(self, split: str):
+        dc = self.cfg
+        return self.dataset_cls(
+            data_path=dc.data_path,
+            data_obj_pc_path=dc.data_obj_pc_path,
+            text_json=dc.text_json,
+            max_nframes=-1,          # per-grasp clips; no windowing
+            data_ratio=dc.get("data_ratio", 1.0),
+            task=self.task,
+            split=split,
+            lhand_layer=self.lhand_layer,
+            rhand_layer=self.rhand_layer,
+            subject_layers=self.subject_layers,
+            stable_grasp_csv=dc.get("stable_grasp_csv"),
         )
 

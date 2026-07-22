@@ -678,3 +678,148 @@ class ObjectModel:
         if self.obj_pc_top is not None:
             return point_set, obj_pc, obj_pc_normal, obj_path, self.obj_pc_top[object_name].copy()
         return point_set, obj_pc, obj_pc_normal, obj_path
+
+
+class StableGraspMotionDataset(MotionDatasetBase):
+    """Stable-grasp subset of a motion dataset (dataset-agnostic base).
+
+    This dataset is a filtered version of the full motion dataset, containing only
+    sequences where the hand maintains a stable grasp on the object throughout
+    the interaction. The stable grasps are selected based on the preprocessed csv file.
+    Each stable grasp motion clip is one item.
+
+    Every **row** of the stable-grasp CSV (``sid_seq_name, side, start, end,
+    angle_diff``) becomes one independent item — left and right hands count
+    separately even when their intervals overlap in time.  Rows are matched to the
+    preprocessed sequences by ``sid_seq_name``; rows whose sequence is absent from
+    the current split (or whose interval is empty after clamping to ``nframes``)
+    are dropped.
+
+    ``__getitem__`` returns the raw x-data window for the grasping hand and the
+    object — no MANO posing (the model poses them):
+
+        x_hand   : (T, 99) float32 — trans(3) + rot6d(16*6) for the grasp's hand
+        x_object : (T, D)  float32 — object x-data (GRAB D=9; ARCTIC D=10 incl. angle)
+        is_lhand / is_rhand : bool — which hand this grasp belongs to
+        obj_name : str
+        n_frames : int  (== end - start)
+
+    Dataset-specific behaviour lives in these subclass hooks:
+      - ``_sg_load_arrays(data, mask)`` : populate per-sequence arrays.
+      - ``_sg_split_mask(data, split)`` : boolean mask selecting the split.
+      - ``_sg_seq_key(seq_idx)``        : ``(subject, seq_name)`` CSV key.
+      - ``_sg_obj_name(seq_idx)``       : object name for a sequence.
+      - ``_sg_x_object(seq_idx, a, b)`` : object x-data window.
+    """
+
+    def __init__(self, *args, stable_grasp_csv=None, **kwargs):
+        # Stored before super().__init__(): _load_data (which reads the CSV and
+        # builds the per-grasp index) runs *inside* the base __init__.
+        self.stable_grasp_csv = stable_grasp_csv
+        super().__init__(*args, **kwargs)
+
+    # --------------------------------------------------------- subclass hooks
+    def _sg_split_mask(self, data, split):
+        raise NotImplementedError
+
+    def _sg_load_arrays(self, data, mask):
+        raise NotImplementedError
+
+    def _sg_seq_key(self, seq_idx):
+        raise NotImplementedError
+
+    def _sg_obj_name(self, seq_idx):
+        raise NotImplementedError
+
+    def _sg_x_object(self, seq_idx, a, b):
+        """Object x-data window ``[a, b)`` for sequence ``seq_idx``."""
+        return np.asarray(self.x_obj[seq_idx][a:b], dtype=np.float32)
+
+    # ------------------------------------------------------------- data load
+    def _load_data(self, data, task, split):
+        mask = self._sg_split_mask(data, split)
+        self._sg_load_arrays(data, mask)
+
+        # Base expects these to exist; this dataset's item derives the hand from
+        # the CSV `side` column instead of the per-sequence flags.
+        self.lcf_idx = self.lcov_idx = self.lchj_idx = self.ldist_value = None
+        self.rcf_idx = self.rcov_idx = self.rchj_idx = self.rdist_value = None
+
+        # Flat per-grasp index: one entry per CSV row that lands in this split.
+        self.stable_grasps = {
+            "seq_idx": [], "start_frame": [], "end_frame": [],
+            "hand_side": [], "obj_name": [],
+        }
+        self._build_stable_grasps()
+
+    def _build_stable_grasps(self):
+        """Read the stable-grasp CSV and flatten its rows into a per-grasp index."""
+        from hoidata.preprocess.preprocess_arctic import load_stable_grasps
+
+        if not self.stable_grasp_csv:
+            raise ValueError(
+                f"{type(self).__name__} requires `stable_grasp_csv` "
+                "(path to the stable-grasp CSV).")
+
+        grasps = load_stable_grasps(self.stable_grasp_csv)
+
+        sg = self.stable_grasps
+        for seq_idx in range(len(self.nframes)):
+            key = self._sg_seq_key(seq_idx)
+            if key not in grasps:
+                continue
+            N = int(self.nframes[seq_idx])
+            obj_name = self._sg_obj_name(seq_idx)
+            for side in ("left", "right"):
+                for s, e in grasps[key][side]:
+                    s = max(0, min(int(s), N))
+                    e = max(0, min(int(e), N))
+                    if e <= s:
+                        continue
+                    sg["seq_idx"].append(seq_idx)
+                    sg["start_frame"].append(s)
+                    sg["end_frame"].append(e)
+                    sg["hand_side"].append(side)
+                    sg["obj_name"].append(obj_name)
+
+    # ------------------------------------------------------------------ mechanics
+    def __len__(self):
+        return len(self.stable_grasps["seq_idx"])
+
+    def __getitem__(self, index):
+        """Return one stable-grasp clip (raw hand + object x-data)."""
+        sg = self.stable_grasps
+        seq_idx = sg["seq_idx"][index]
+        a = sg["start_frame"][index]
+        b = sg["end_frame"][index]
+        side = sg["hand_side"][index]
+
+        x_hand = (self.x_lhand if side == "left" else self.x_rhand)[seq_idx][a:b]
+        return {
+            "x_hand":   np.asarray(x_hand, dtype=np.float32),   # (T, 99)
+            "x_object": self._sg_x_object(seq_idx, a, b),       # (T, 9|10)
+            "is_lhand": side == "left",
+            "is_rhand": side == "right",
+            "obj_name": str(sg["obj_name"][index]),
+            "n_frames": b - a,
+        }
+
+    # ------------------------------------------------------------------- hooks
+    # Indexed per grasp, not per sequence (mirrors the per-grasp __getitem__).
+    def _object_name(self, index):
+        return self.stable_grasps["obj_name"][index]
+
+    def _text(self, index, is_lhand, is_rhand):
+        raise NotImplementedError("StableGraspMotionDataset has no text prompts.")
+
+    def _slice_obj(self, index, init_frame, nframes):
+        raise NotImplementedError("StableGraspMotionDataset uses its own __getitem__.")
+
+    def _obj_delta(self, x_obj, nframes, max_nframes):
+        raise NotImplementedError("StableGraspMotionDataset uses its own __getitem__.")
+
+    def _object_pc(self, object_name, item):
+        raise NotImplementedError("StableGraspMotionDataset uses its own __getitem__.")
+
+    def _obj_traj_from_xobj(self, x_obj, nframes):
+        raise NotImplementedError("StableGraspMotionDataset uses its own __getitem__.")
