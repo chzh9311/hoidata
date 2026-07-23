@@ -290,8 +290,10 @@ class TransitionMotionGRAB(MotionGRAB):
         """Return one transition window: raw hand + object x-data.
 
         Neither hand nor object is posed here — the model consumes the raw
-        ``x_hand`` (trans + rot6d) and ``x_obj`` (trans + rot6d) windows and
-        poses them itself.
+        ``x_hand`` (trans + rot6d) and ``x_object`` (trans + rot6d) windows and
+        poses them itself.  Key names match ``StableGraspMotionDataset``
+        (``x_hand`` / ``x_object`` / ``n_frames``) so both clip types can be
+        consumed uniformly.
         """
         tm = self.transition_motions
         seq_idx = tm["seq_idx"][index]
@@ -316,14 +318,14 @@ class TransitionMotionGRAB(MotionGRAB):
 
         x_hand = (self.x_lhand if side == "left" else self.x_rhand)[seq_idx][a:b]
         x_hand = np.asarray(x_hand, dtype=np.float32)   # (Tt, D) trans + rot6d
-        x_obj = np.asarray(self.x_obj[seq_idx][a:b], dtype=np.float32)  # (Tt, 9) trans + rot6d
+        x_object = np.asarray(self.x_obj[seq_idx][a:b], dtype=np.float32)  # (Tt, 9)
 
         item = {
             "x_hand":      x_hand,                        # (Tt, D) raw hand x-data
-            "x_obj":       x_obj,                         # (Tt, 9) raw object x-data
+            "x_object":    x_object,                      # (Tt, 9) raw object x-data
             "hand_sides":  [side],
             "obj_name":    str(self.obj_name[seq_idx]),
-            "nframes":     Tt,
+            "n_frames":    Tt,
             "transition_type": ttype,
             "seq_idx":     int(seq_idx),
             "start_frame": int(a),

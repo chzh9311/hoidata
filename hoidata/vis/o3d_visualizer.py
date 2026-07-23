@@ -203,8 +203,9 @@ def pose_transition_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) ->
 
     Unlike :func:`pose_sample` (which re-poses the whole sequence's object off
     ``ds.x_obj[index]``), a transition item already carries its own sliced
-    ``x_hand``/``x_obj`` windows, so both hand and object are posed directly from
-    the item.  Returns the same dict shape the viewer expects.
+    ``x_hand``/``x_object`` windows, so both hand and object are posed directly
+    from the item.  Returns the same dict shape the viewer expects (note the
+    viewer's own key is ``nframes``, while the dataset item uses ``n_frames``).
     """
     from hoidata.utils.proc import transform_xdata_to_verts
 
@@ -215,12 +216,12 @@ def pose_transition_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) ->
     # Hand: raw x-data window → world-space MANO vertices for the single hand.
     hand_verts = transform_xdata_to_verts(item["x_hand"], layer).astype(np.float32)  # (Tt,778,3)
 
-    # Object: rigid GRAB mesh posed per frame from the sliced x_obj window.
+    # Object: rigid GRAB mesh posed per frame from the sliced x_object window.
     _, _, _, obj_path = ObjectModel(cfg.data_obj_pc_path)(item["obj_name"])
     mesh = trimesh.load(osp.join(cfg.obj_root, obj_path), process=False)
     obj_verts_t = process_obj_result(
         proc_torch_cuda(np.asarray(mesh.vertices, dtype=np.float32)),
-        proc_torch_cuda(item["x_obj"]),
+        proc_torch_cuda(item["x_object"]),
         "grab",
     )
     obj_verts = proc_numpy(obj_verts_t)
@@ -237,7 +238,7 @@ def pose_transition_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) ->
         "hand_sides": item["hand_sides"],
         "obj_verts": obj_verts,
         "obj_faces": obj_faces,
-        "nframes": item["nframes"],
+        "nframes": item["n_frames"],
         "obj_name": item["obj_name"],
         # Label carries object / hand / transition-type (see transition_label).
         "action_name": ds.transition_label(index),

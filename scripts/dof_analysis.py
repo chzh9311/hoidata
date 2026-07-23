@@ -89,6 +89,11 @@ def analyze(datasets):
     print("\n[analyze] not implemented yet — datasets are loaded and ready.")
     for name, ds in datasets.items():
         print(f"  {name}: {len(ds)} clips available as ds[i]['x_hand']")
+        for i, it in enumerate(ds):
+            print(f"    ds[{i}]: x_hand={it['x_hand'].shape} x_object={it['x_object'].shape} "
+                  f"obj={it['obj_name']} n_frames={it['n_frames']}")
+            if i >= 2:
+                break
 
 
 def main():
@@ -121,16 +126,11 @@ def main():
         tr = load_dataset(TransitionMotionGRABDataModule, cfg, args.split,
                           lhand_layer, rhand_layer)
         datasets["transition_grab"] = tr
-        # Transition items use the same x_hand/x_object layout but name the
-        # object stream "x_obj"; describe() expects "x_object", so summarize here.
-        print(f"\n=== transitions (grab, {args.split}) ===")
-        print(f"  items: {len(tr)}")
+        describe(f"transitions (grab, {args.split})", tr)
         if len(tr):
-            it = tr[0]
-            lens = np.array([tr[i]["nframes"] for i in range(len(tr))])
-            print(f"  frames: min={lens.min()} max={lens.max()} mean={lens.mean():.1f}")
-            print(f"  item[0]: x_hand={it['x_hand'].shape} x_obj={it['x_obj'].shape} "
-                  f"type={it['transition_type']} obj={it['obj_name']}")
+            types = [tr[i]["transition_type"] for i in range(len(tr))]
+            counts = {t: types.count(t) for t in sorted(set(types))}
+            print(f"  types:  {counts}")
 
     analyze(datasets)
 
