@@ -24,8 +24,10 @@ import argparse
 
 import numpy as np
 from omegaconf import OmegaConf
+import torch
 
 from hoidata.utils.hand_proc import ManoLayerWrapper
+from hoidata.utils.rot import rot6d_to_rotmat, rotmat_to_rot6d, vee_vector, cross_matrix, axis_angle_to_rotmat
 from hoidata.dataloaders.grab_dataset import (
     StableGraspGRABDataModule, TransitionMotionGRABDataModule)
 from hoidata.dataloaders.arctic_dataset import StableGraspARCTICDataModule
@@ -78,6 +80,29 @@ def describe(name, ds):
           f"obj={it['obj_name']} n_frames={it['n_frames']}")
 
 
+def avg_rotation_axis(Rs):
+    """Dominant rotation axis of a batch of rotation matrices (T, 3, 3).
+
+    The skew part of each R is ``sin(theta) * [u]_x``, so ``vee`` of it gives
+    ``sin(theta) * u`` — a vector along that frame's rotation axis, weighted by
+    how much it rotates.  Stacking those into the scatter matrix
+    ``M = S^T S`` and taking the eigenvector of the largest eigenvalue yields the
+    axis that best explains the whole batch (a least-squares fit, so small-angle
+    frames contribute little and noise averages out).
+
+    Note this is an *axis*, not a full mean rotation: sign is arbitrary (``u``
+    and ``-u`` span the same eigenspace) and the angle is not recovered.  Frames
+    rotating by ~180 deg have ``sin(theta) ~ 0`` and drop out.
+
+    Returns a unit ``(3,)`` tensor.
+    """
+    sinaa = vee_vector((Rs - Rs.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
+    M = sinaa.transpose(0, 1) @ sinaa  # (3, 3), symmetric PSD
+    # eigh returns eigenvalues ascending, so the last column is the dominant axis.
+    _, evecs = torch.linalg.eigh(M)
+    return evecs[:, -1]
+
+
 def analyze(datasets):
     """Placeholder for the DOF analysis.
 
@@ -92,8 +117,58 @@ def analyze(datasets):
         for i, it in enumerate(ds):
             print(f"    ds[{i}]: x_hand={it['x_hand'].shape} x_object={it['x_object'].shape} "
                   f"obj={it['obj_name']} n_frames={it['n_frames']}")
-            if i >= 2:
-                break
+            # Datasets yield numpy; the rot utils are torch, so convert at the boundary.
+            x_object = torch.from_numpy(it['x_object']).float()  # (T, 9|10)
+            x_hand = torch.from_numpy(it['x_hand']).float()      # (T, 99)
+
+            obj_rot = x_object[:, 3:9]  # (T, 6) rot6d
+            obj_R = rot6d_to_rotmat(obj_rot)  # (T, 3, 3)
+            obj_t = x_object[:, :3]  # (T, 3) translation
+            wrist_rot = x_hand[:, 3:9]  # (T, 6) rot6d
+            wrist_R = rot6d_to_rotmat(wrist_rot)  # (T, 3, 3)
+            wrist_t = x_hand[:, :3]  # (T, 3) translation
+            obj2wrist_R = wrist_R.transpose(1, 2) @ obj_R  # (T, 3, 3)
+            sinaa = vee_vector((obj2wrist_R - obj2wrist_R.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
+            M = sinaa.transpose(0, 1) @ sinaa  # (3, 3), symmetric PSD
+            # eigh returns eigenvalues ascending, so the last column is the dominant axis.
+            _, evecs = torch.linalg.eigh(M)
+            axis = evecs[:, -1]  # (3,) dominant rotation axis
+            # Per-frame signed angle about `axis`.  cos from the trace, sin from
+            # projecting sin(theta)*u onto the axis; atan2 of the two resolves
+            # the full +-180 deg range (arccos/arcsin alone would fold it).
+            cos_a = (torch.diagonal(obj2wrist_R, dim1=1, dim2=2).sum(-1) - 1) / 2  # (T,)
+            sin_a = sinaa @ axis  # (T,)
+            angle = torch.atan2(sin_a, cos_a)  # (T,) signed, sign tied to `axis`
+            recovered_aa = angle.unsqueeze(-1) * axis  # (T, 3) axis-angle per frame
+            recovered_R = axis_angle_to_rotmat(recovered_aa)  # (T, 3, 3) rotation matrix of the average rotation
+            delta_R = obj2wrist_R.transpose(1, 2) @ recovered_R  # (T, 3, 3) difference from average rotation
+            # Per-frame residual angle; clamp guards acos against |cos|>1 from roundoff.
+            cos_d = (torch.diagonal(delta_R, dim1=1, dim2=2).sum(-1) - 1) / 2  # (T,)
+            delta_aa = torch.acos(cos_d.clamp(-1.0, 1.0))  # (T,) angle of the difference rotation
+
+            # Constant pivot t, assuming the clip is a rotation about a fixed point:
+            #   x -> R_i (x - t) + t = R_i x + (I - R_i) t.
+            # The observed relative translation is the object origin in the wrist
+            # frame, so each frame contributes 3 equations (I - R_i) t = d_i.
+            obj2wrist_t = torch.einsum(
+                'tij,tj->ti', wrist_R.transpose(1, 2), obj_t - wrist_t)  # (T, 3)
+            I = torch.eye(3, dtype=obj2wrist_R.dtype).expand_as(obj2wrist_R)  # (T, 3, 3)
+            A = (I - recovered_R).reshape(-1, 3)  # (3T, 3)
+            # The system is homogeneous in t (the constant is implied by the
+            # model), so obj2wrist_t must NOT be mean-centred -- centring removes
+            # the signal the pivot is fitted from and biases the solution.
+            b = obj2wrist_t.reshape(-1)  # (3T,)
+            # (I - R) is singular along `axis` for every frame, so A is rank <= 2: the
+            # component of t along the axis is unobservable (sliding the pivot along
+            # the axis leaves the transform unchanged).  gelsd handles the rank
+            # deficiency and returns the minimum-norm solution, pinning that free
+            # component to 0 -- so t is a point *on* the axis, not a unique 3-D pivot.
+            pivot = torch.linalg.lstsq(A, b, driver='gelsd').solution  # (3,)
+            resid = (A @ pivot - b).reshape(-1, 3).norm(dim=-1)  # (T,) per-frame fit error
+
+            print(f"      resid_angle={(delta_aa * 180 / torch.pi).mean():.2f}deg "
+                  f"pivot={pivot.numpy().round(4)} "
+                  f"pivot_resid={resid.mean():.4f}m")
 
 
 def main():

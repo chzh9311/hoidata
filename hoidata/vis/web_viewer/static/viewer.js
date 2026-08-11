@@ -79,14 +79,19 @@ function clearMeshes() {
   meshes = [];
 }
 
-function makeMesh(positionsFrame0, faces, colorArr, V) {
+function makeMesh(positionsFrame0, faces, colorArr, V, opacity = 1.0) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(positionsFrame0.slice(), 3));
   geom.setIndex(new THREE.BufferAttribute(faces, 1));
   geom.computeVertexNormals();
   const color = new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
+  const transparent = opacity < 1.0;
   const material = new THREE.MeshStandardMaterial({
     color, roughness: 0.75, metalness: 0.0, side: THREE.DoubleSide,
+    transparent, opacity,
+    // Don't write depth for translucent meshes so two overlapping objects
+    // (true vs. reconstructed) blend instead of one hiding the other.
+    depthWrite: !transparent,
   });
   const mesh = new THREE.Mesh(geom, material);
   scene.add(mesh);
@@ -110,12 +115,16 @@ function buildScene(meta, buffer) {
   activeLabelIdx = -1;
 
   const arrays = meta.arrays;
+  // When extra objects are overlaid in the same space (wrist-aligned view:
+  // true vs. reconstructed), draw the objects semitransparent so both read.
+  const hasExtras = (meta.extras || []).length > 0;
+  const objOpacity = hasExtras ? 0.5 : 1.0;
   const objFaces = new Uint32Array(viewArray(buffer, arrays.obj_faces)); // copy to Uint32
   const objVertsEntry = arrays.obj_verts;                                // (T, Vo, 3)
   const Vo = objVertsEntry.shape[1];
   const objVerts = viewArray(buffer, objVertsEntry);
   meshes.push({
-    mesh: makeMesh(objVerts.subarray(0, Vo * 3), objFaces, meta.obj_color, Vo),
+    mesh: makeMesh(objVerts.subarray(0, Vo * 3), objFaces, meta.obj_color, Vo, objOpacity),
     positions: objVerts, V: Vo,
     baseColor: new THREE.Color(...meta.obj_color),
   });
@@ -131,6 +140,22 @@ function buildScene(meta, buffer) {
       mesh: makeMesh(verts.subarray(0, V * 3), faces, col, V),
       positions: verts, V,
       baseColor: new THREE.Color(...col),
+    });
+  }
+
+  // Extra meshes (e.g. reconstructed object) — same space, own color.
+  for (const ex of (meta.extras || [])) {
+    const facesEntry = arrays['extra_faces_' + ex.name];
+    const vertsEntry = arrays['extra_verts_' + ex.name];
+    if (!facesEntry || !vertsEntry) continue;
+    const V = vertsEntry.shape[1];
+    const faces = new Uint32Array(viewArray(buffer, facesEntry));
+    const verts = viewArray(buffer, vertsEntry);
+    const exOpacity = (ex.opacity != null) ? ex.opacity : 0.5;
+    meshes.push({
+      mesh: makeMesh(verts.subarray(0, V * 3), faces, ex.color, V, exOpacity),
+      positions: verts, V,
+      baseColor: new THREE.Color(...ex.color),
     });
   }
 

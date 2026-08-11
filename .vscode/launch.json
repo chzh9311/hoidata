@@ -21,6 +21,49 @@
             "cwd": "${workspaceFolder}",
             "justMyCode": false,
             "args": "${command:pickArgs}"
+        },
+        {
+            "name": "Data loading analysis",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.dof_analysis",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "args": "${command:pickArgs}"
+        },
+        {
+            // Launch the web viewer in wrist-aligned mode under the debugger.
+            // Set breakpoints in hoidata/vis/o3d_visualizer.py ->
+            // pose_wrist_aligned_sample (and _fit_fixed_axis_motion) and open a
+            // sequence in the browser to trigger posing; inspect wrist_R,
+            // wrist_o, R_true/t_true, R_rec/t_rec, obj_true/obj_rec live.
+            "name": "Debug wrist-aligned viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": [
+                "--config", "configs/grab.yaml",
+                "--split", "test",
+                "--wrist-aligned"
+            ]
+        },
+        {
+            // Same viewer, but let you type extra args at launch (e.g. a
+            // different --split / --port) via the arg picker.
+            "name": "Debug wrist-aligned viewer (pick args)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": "${command:pickArgs}"
         }
     ]
 }

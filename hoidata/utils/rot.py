@@ -55,6 +55,30 @@ def axis_angle_to_rotmat(axis_angle):
             )
         )
 
+def cross_matrix(v):
+    x, y, z = v[..., 0], v[..., 1], v[..., 2]
+    shape = v.shape[:-1]
+    return torch.stack([
+        torch.zeros_like(x),
+        -z,
+        y,
+        z,
+        torch.zeros_like(x),
+        -x,
+        -y,
+        x,
+        torch.zeros_like(x)
+    ], dim=-1).view(*shape, 3, 3)
+
+
+def vee_vector(M):
+    return torch.stack([
+        M[..., 2, 1],
+        M[..., 0, 2],
+        M[..., 1, 0]
+    ], dim=-1)
+
+
 def quaternion_to_rotation_matrix(quat):
     """Convert quaternion coefficients to rotation matrix.
     Args:

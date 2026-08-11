@@ -15,8 +15,9 @@ import open3d as o3d
 from omegaconf import OmegaConf
 
 from hoidata.dataloaders.action_dataset import ObjectModel
-from hoidata.dataloaders.grab_dataset import MotionGRAB, TransitionMotionGRAB
-from hoidata.dataloaders.arctic_dataset import MotionARCTIC
+from hoidata.dataloaders.grab_dataset import (
+    MotionGRAB, TransitionMotionGRAB, StableGraspGRAB)
+from hoidata.dataloaders.arctic_dataset import MotionARCTIC, StableGraspARCTIC
 from hoidata.utils.hand_proc import ManoLayerWrapper
 from hoidata.utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
 from hoidata.utils.proc_arctic import process_object
@@ -158,6 +159,193 @@ def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0)
     }
 
 
+def _fit_fixed_axis_motion(R_wrist_frame, t_wrist_frame):
+    """Fit a fixed-axis / fixed-pivot model to wrist-frame object motion.
+
+    Takes the object pose **already expressed in the wrist frame** — ``R`` (T,3,3)
+    and ``t`` (T,3) — so the fit and any drawing share one frame by construction.
+
+    Mirrors the estimator in ``scripts/dof_analysis.py``: the dominant rotation
+    axis comes from the scatter of ``sin(theta) * u`` over frames, the per-frame
+    signed angle from ``atan2`` of the trace-cosine and the axis-projected sine,
+    and the pivot from the least-squares system ``(I - R_i) t = d_i``.
+
+    Returns ``(R_rec, t_rec, axis, angle, resid_deg)`` where ``R_rec`` (T,3,3)
+    and ``t_rec`` (T,3) are the *reconstructed* wrist-frame object pose under the
+    single-axis assumption.
+    """
+    import torch
+    from hoidata.utils.rot import vee_vector, axis_angle_to_rotmat
+
+    R = torch.from_numpy(np.asarray(R_wrist_frame, dtype=np.float32))    # (T,3,3)
+    t = torch.from_numpy(np.asarray(t_wrist_frame, dtype=np.float32))    # (T,3)
+
+    sinaa = vee_vector((R - R.transpose(1, 2)) / 2)                      # sin(th)*u
+    axis = torch.linalg.eigh(sinaa.transpose(0, 1) @ sinaa)[1][:, -1]    # (3,)
+    cos_a = (torch.diagonal(R, dim1=1, dim2=2).sum(-1) - 1) / 2
+    angle = torch.atan2(sinaa @ axis, cos_a)                             # (T,)
+    R_rec = axis_angle_to_rotmat(angle.unsqueeze(-1) * axis)             # (T,3,3)
+
+    # Pivot: (I - R_i) t = t_i, rank-2 (axis component unobservable) → gelsd.
+    # The system is homogeneous in t — the constant is already implied by the
+    # model — so t must NOT be mean-centred here; centring destroys the very
+    # signal the pivot is fitted from and biases the result.
+    #
+    # (I - R_i) maps onto the plane perpendicular to `axis`, so a fixed-pivot
+    # model can ONLY produce translation perpendicular to the axis — it cannot
+    # represent any motion along the axis.  Real grasps sit at a (roughly
+    # constant) offset up the axis, which the pure model drops, leaving a
+    # constant along-axis displacement between t_rec and t_true.  Split t into
+    # its along-axis and perpendicular parts: fit the pivot on the perpendicular
+    # part (which the model can represent) and add the mean along-axis offset
+    # back so the reconstruction overlays the true object.
+    I = torch.eye(3, dtype=R.dtype).expand_as(R)
+    t_along = t @ axis                                                   # (T,) signed
+    t_perp = t - t_along.unsqueeze(-1) * axis                            # (T,3)
+    A = (I - R_rec).reshape(-1, 3)
+    b = t_perp.reshape(-1)
+    pivot = torch.linalg.lstsq(A, b, driver='gelsd').solution            # (3,)
+
+    # Reconstructed translation: perpendicular part from the pivot model, plus
+    # the constant along-axis offset the model cannot represent.
+    t_rec = (torch.einsum('tij,j->ti', I - R_rec, pivot)
+             + t_along.mean() * axis)                                    # (T,3)
+
+    delta_R = R.transpose(1, 2) @ R_rec
+    cos_d = (torch.diagonal(delta_R, dim1=1, dim2=2).sum(-1) - 1) / 2
+    resid_deg = torch.rad2deg(torch.acos(cos_d.clamp(-1.0, 1.0)))        # (T,)
+
+    return (proc_numpy(R_rec), proc_numpy(t_rec), proc_numpy(axis),
+            proc_numpy(angle), proc_numpy(resid_deg))
+
+
+def _wrist_origin(x_hand, layer):
+    """Posed wrist (root) joint position per frame, (T, 3).
+
+    ``x_hand[:, :3]`` is MANO's global translation, which is *not* the wrist
+    position — the mesh is built around the root joint.  Posing the layer and
+    reading ``joints_w_tip[:, 0]`` gives the actual wrist.
+    """
+    import torch
+    from hoidata.utils.rot import rot6d_to_axis_angle
+
+    xd = proc_torch_cuda(np.asarray(x_hand, dtype=np.float32))
+    T = xd.shape[0]
+    pose = rot6d_to_axis_angle(xd[:, 3:].reshape(-1, 6)).reshape(T, 48)
+    betas = torch.zeros(T, 10, device=xd.device)
+    out = layer(pose, betas, xd[:, :3])
+    return proc_numpy(out.joints_w_tip[:, 0]).astype(np.float32)
+
+
+def pose_wrist_aligned_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Wrist-aligned original vs. fixed-axis-reconstructed object motion.
+
+    Everything is drawn in the **wrist frame** of the transition hand: the hand
+    is de-rotated/de-translated by its own per-frame root pose (so it sits still
+    at the origin), and the object is shown twice in that same space —
+
+      - ``obj_verts``  : the true object motion relative to the wrist;
+      - extra mesh ``obj_recovered`` : the same mesh under the fitted fixed-axis /
+        fixed-pivot model.
+
+    Divergence between the two is exactly the model error reported as
+    ``resid_angle`` by ``scripts/dof_analysis.py``.
+    """
+    from hoidata.utils.proc import transform_xdata_to_verts
+    from hoidata.utils.rot import rot6d_to_rotmat
+    import torch
+
+    item = ds[index]
+    # Stable-grasp items expose is_lhand/is_rhand (one grasp = one hand); the
+    # transition dataset exposes hand_sides instead. Accept either.
+    if "hand_sides" in item:
+        side = item["hand_sides"][0]
+    else:
+        side = "left" if item["is_lhand"] else "right"
+    layer = lhand_layer if side == "left" else rhand_layer
+
+    x_hand, x_object = item["x_hand"], item["x_object"]
+    T = int(item["n_frames"])
+
+    # World-space hand, then map into the wrist frame: v -> R_w^T (v - o_w).
+    # The origin is the posed **wrist joint**, not x_hand[:, :3] — MANO applies
+    # the latter as a global offset while the mesh is built around the root
+    # joint, so subtracting it would leave the hand off-origin.
+    hand_verts = transform_xdata_to_verts(x_hand, layer).astype(np.float32)  # (T,778,3)
+    xh = torch.from_numpy(np.asarray(x_hand, dtype=np.float32))
+    wrist_R = proc_numpy(rot6d_to_rotmat(xh[:, 3:9]))                        # (T,3,3)
+    wrist_o = _wrist_origin(x_hand, layer)                                   # (T,3)
+    hand_local = np.einsum('tji,tvj->tvi', wrist_R, hand_verts - wrist_o[:, None])
+
+    # Canonical object geometry (GRAB applies R^T — see process_obj_result).
+    # Prefer the full .ply mesh; fall back to the sampled point cloud from
+    # obj.pkl when the raw GRAB meshes aren't present (renders as points, which
+    # is enough to compare the two trajectories).
+    _, obj_pc, _, obj_path = ObjectModel(cfg.data_obj_pc_path)(item["obj_name"])
+    mesh_path = osp.join(cfg.obj_root, obj_path)
+    if osp.isfile(mesh_path):
+        mesh = trimesh.load(mesh_path, process=False)
+        verts0 = np.asarray(mesh.vertices, dtype=np.float32)                 # (V,3)
+        obj_faces = np.asarray(mesh.faces)
+    else:
+        verts0 = np.asarray(obj_pc, dtype=np.float32)                        # (P,3)
+        obj_faces = np.zeros((0, 3), dtype=np.int64)                         # points only
+
+    # True wrist-frame object pose, using the same wrist origin as the hand.
+    #
+    # GRAB stores the object rotation un-inverted (rot6d of R_o), and the
+    # rotation actually *applied* to the mesh at display time is R_o^T — see
+    # process_obj_result's grab branch (einsum 'tij,ki->tkj' == verts @ R_o ==
+    # applies R_o^T).  In world space a vertex lands at  R_o^T v0 + t_o.  Mapping
+    # that into the wrist frame,  v_wrist = R_w^T (v_world - o_w),  gives an
+    # applied rotation  R_true = R_w^T R_o^T = (R_o R_w)^T  and translation
+    # t_true = R_w^T (t_o - o_w).  R_true is the object's actual orientation in
+    # the wrist frame, so both the fixed-axis fit and the drawing use it
+    # directly (plain multiply, no extra transpose).
+    xo = torch.from_numpy(np.asarray(x_object, dtype=np.float32))
+    obj_R = proc_numpy(rot6d_to_rotmat(xo[:, 3:9]))                          # R_o (stored)
+    obj_t = np.asarray(x_object[:, :3], dtype=np.float32)
+    R_true = np.einsum('tji,tkj->tik', wrist_R, obj_R)                       # R_w^T R_o^T
+    t_true = np.einsum('tji,tj->ti', wrist_R, obj_t - wrist_o)
+
+    R_rec, t_rec, axis, angle, resid_deg = _fit_fixed_axis_motion(R_true, t_true)
+
+    # R_true/R_rec are already the applied wrist-frame rotation → direct multiply.
+    obj_true = np.einsum('tij,kj->tki', R_true, verts0) + t_true[:, None]
+    obj_rec = np.einsum('tij,kj->tki', R_rec, verts0) + t_rec[:, None]
+
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    if hasattr(ds, "transition_label"):
+        label = ds.transition_label(index)
+    else:
+        label = f"{item['obj_name']} {side} grasp #{index}"
+    return {
+        "hand_verts": hand_local.astype(np.float32),
+        "hand_faces": hand_faces,
+        "hand_sides": [side],
+        "obj_verts": obj_true.astype(np.float32),
+        "obj_faces": obj_faces,
+        # Reconstructed object, same mesh/topology, drawn in the same space.
+        "extra_meshes": [{
+            "name": "obj_recovered",
+            "verts": obj_rec.astype(np.float32),
+            "faces": obj_faces,
+            "color": [0.95, 0.55, 0.20],
+            "opacity": 0.5,
+        }],
+        "nframes": T,
+        "obj_name": item["obj_name"],
+        "action_name": f"{label} | resid={resid_deg.mean():.1f}deg",
+        "labels": [],
+        "subject": "",
+        "grasps": {"left": [], "right": []},
+    }
+
+
 def build_transition_dataset(cfg, split: str = "test", aug_p=None):
     """Build the MANO layers and a :class:`TransitionMotionGRAB` dataset.
 
@@ -194,6 +382,39 @@ def build_transition_dataset(cfg, split: str = "test", aug_p=None):
         min_len=cfg.get("transition_min_len", 10),
         max_len=cfg.get("transition_max_len", 100),
         aug_p=aug_p,
+    )
+    return ds, lhand_layer, rhand_layer
+
+
+def build_stable_grasp_dataset(cfg, dataset_name: str, split: str = "test"):
+    """Build the MANO layers and a stable-grasp dataset (one item per grasp).
+
+    Mirrors :func:`build_dataset` but constructs :class:`StableGraspGRAB` /
+    :class:`StableGraspARCTIC`, indexed per stable-grasp CSV row rather than per
+    sequence.  Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+
+    dataset_cls = {"grab": StableGraspGRAB, "arctic": StableGraspARCTIC}[dataset_name]
+    ds = dataset_cls(
+        data_path=cfg.data_path,
+        data_obj_pc_path=cfg.data_obj_pc_path,
+        text_json=cfg.text_json,
+        max_nframes=-1,
+        task="evaluate",
+        split=split,
+        lhand_layer=lhand_layer,
+        rhand_layer=rhand_layer,
+        stable_grasp_csv=cfg.get("stable_grasp_csv"),
     )
     return ds, lhand_layer, rhand_layer
 

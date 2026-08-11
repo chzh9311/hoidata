@@ -31,7 +31,8 @@ from flask import Flask, Response, jsonify, render_template
 from omegaconf import OmegaConf
 
 from hoidata.vis.o3d_visualizer import (
-    build_dataset, pose_sample, build_transition_dataset, pose_transition_sample)
+    build_dataset, pose_sample, build_transition_dataset, pose_transition_sample,
+    build_stable_grasp_dataset, pose_wrist_aligned_sample)
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
 OBJECT_COLOR = [0.6, 0.7, 0.9]
@@ -57,10 +58,11 @@ STATE = {
     "cache": {},        # index -> (meta_dict, bytes)
     "fps": 30,
     "transition": False,  # True → GRAB transition-motion dataset
+    "wrist_aligned": False,  # True → wrist-frame original vs. reconstructed object
 }
 
 
-def _build_sequence_list(ds, transition=False):
+def _build_sequence_list(ds, transition=False, wrist_aligned=False):
     """Cheap per-index metadata for the dropdown — no MANO/GPU posing.
 
     Uses the ``_object_name`` hook (uniform across GRAB/ARCTIC) rather than a
@@ -69,11 +71,22 @@ def _build_sequence_list(ds, transition=False):
 
     For the transition dataset each index is a *transition* (not a sequence), so
     per-transition helpers (``transition_label`` / ``transition_nframes``) supply
-    the label and length.
+    the label and length.  For the wrist-aligned view each index is a *stable
+    grasp* (one CSV row): the length comes from the flat per-grasp index arrays.
     """
     seqs = []
     for i in range(len(ds)):
-        if transition:
+        if wrist_aligned:
+            sg = ds.stable_grasps
+            side = sg["hand_side"][i]
+            nframes = int(sg["end_frame"][i]) - int(sg["start_frame"][i])
+            seqs.append({
+                "index": i,
+                "obj_name": str(ds._object_name(i)),
+                "action_name": f"{ds._object_name(i)} {side} grasp #{i}",
+                "nframes": nframes,
+            })
+        elif transition:
             seqs.append({
                 "index": i,
                 "obj_name": str(ds._object_name(i)),
@@ -126,9 +139,18 @@ def _serialize_sample(sample):
     for side in hand_sides:
         _add(f"hand_faces_{side}", sample["hand_faces"][side], np.int32)
 
+    # Optional extra meshes (e.g. a reconstructed object shown alongside the
+    # original).  Each carries its own faces/verts/color and is drawn in the
+    # same space as everything else.
+    extras = sample.get("extra_meshes", []) or []
+    for ex in extras:
+        _add(f"extra_faces_{ex['name']}", ex["faces"], np.int32)
+
     _add("obj_verts", obj_verts, np.float32)
     for i, side in enumerate(hand_sides):
         _add(f"hand_verts_{side}", hand_verts[:, i * 778:(i + 1) * 778], np.float32)
+    for ex in extras:
+        _add(f"extra_verts_{ex['name']}", np.asarray(ex["verts"])[:nframes], np.float32)
 
     # Annotation intervals (may be empty). Keys are plain ints/str → JSON-safe.
     labels = [
@@ -155,6 +177,11 @@ def _serialize_sample(sample):
         "label_colors": LABEL_COLORS,
         "labels": labels,
         "grasps": grasps,
+        "extras": [
+            {"name": ex["name"], "color": list(ex["color"]),
+             "opacity": float(ex.get("opacity", 0.5))}
+            for ex in extras
+        ],
         "fps": STATE["fps"],
         "arrays": manifest,
     }
@@ -166,7 +193,12 @@ def _get_sequence_payload(index):
     """Return (meta, blob) for a sequence, posing + caching on first request."""
     if index in STATE["cache"]:
         return STATE["cache"][index]
-    if STATE["transition"]:
+    if STATE["wrist_aligned"]:
+        sample = pose_wrist_aligned_sample(
+            STATE["cfg"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    elif STATE["transition"]:
         sample = pose_transition_sample(
             STATE["cfg"], STATE["ds"],
             STATE["lhand_layer"], STATE["rhand_layer"], index,
@@ -222,12 +254,22 @@ def main():
                         help="Override transition random-trim augmentation "
                              "probability (default: config aug_p; 0 = raw windows). "
                              "Only used with --transition.")
+    parser.add_argument("--wrist-aligned", action="store_true",
+                        help="Draw stable-grasp actions in the wrist frame: hand "
+                             "fixed at the origin, with the true object motion and "
+                             "the fixed-axis reconstruction overlaid in the same "
+                             "space (one item per stable grasp).")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
     dataset_name = cfg.name
 
-    if args.transition:
+    if args.wrist_aligned:
+        print(f"Building stable-grasp dataset ({dataset_name}, "
+              f"split={args.split}) for the wrist-aligned view ...")
+        ds, lhand_layer, rhand_layer = build_stable_grasp_dataset(
+            cfg, dataset_name, args.split)
+    elif args.transition:
         if dataset_name != "grab":
             parser.error("--transition is only supported for the GRAB config.")
         aug_p = args.aug_p if args.aug_p is not None else cfg.get("aug_p", 0.0)
@@ -238,7 +280,8 @@ def main():
     else:
         print(f"Building dataset ({dataset_name}, split={args.split}) ...")
         ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
-    sequences = _build_sequence_list(ds, transition=args.transition)
+    sequences = _build_sequence_list(
+        ds, transition=args.transition, wrist_aligned=args.wrist_aligned)
 
     STATE.update({
         "cfg": cfg,
@@ -251,9 +294,11 @@ def main():
         "cache": {},
         "fps": args.fps,
         "transition": args.transition,
+        "wrist_aligned": args.wrist_aligned,
     })
 
-    kind = "transitions" if args.transition else "sequences"
+    kind = ("stable grasps" if args.wrist_aligned
+            else "transitions" if args.transition else "sequences")
     print(f"Loaded {len(sequences)} {kind}. Serving at "
           f"http://{args.host}:{args.port}/  ({kind} posed lazily on first view)")
     # threaded=False keeps GPU posing serialized (one CUDA context, no reentrancy).
