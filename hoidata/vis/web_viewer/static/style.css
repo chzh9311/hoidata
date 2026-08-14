@@ -223,3 +223,78 @@ button.nav:hover { background: #414653; }
   text-overflow: ellipsis;
   max-width: 40%;
 }
+
+/* action-label editor (--label mode) ----------------------------------- */
+#editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px 12px;
+  background: #24272f;
+  border-top: 1px solid #333743;
+}
+#editor .ed-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#editor label {
+  font-size: 12px;
+  color: #9aa0ad;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+#editor input[type="number"] {
+  width: 72px;
+  padding: 5px 6px;
+  background: #1b1d23;
+  color: #e8e8ec;
+  border: 1px solid #3a3f4b;
+  border-radius: 6px;
+  font-size: 13px;
+}
+#editor #edAction {
+  flex: 1 1 200px;
+  min-width: 140px;
+  padding: 6px 8px;
+  background: #1b1d23;
+  color: #e8e8ec;
+  border: 1px solid #3a3f4b;
+  border-radius: 6px;
+  font-size: 13px;
+}
+#editor #edHand {
+  padding: 6px 8px;
+  background: #1b1d23;
+  color: #e8e8ec;
+  border: 1px solid #3a3f4b;
+  border-radius: 6px;
+  font-size: 13px;
+}
+#editor button { background: #333743; }
+#editor button:hover { background: #414653; }
+#editor #edSave.primary { background: #3a5bd0; }
+#editor #edSave.primary:hover { background: #4a6ae0; }
+#editor #edDelete:hover { background: #a23a3a; }
+#edStatus {
+  margin-left: auto;
+  font-size: 12px;
+  color: #9aa0ad;
+  white-space: nowrap;
+}
+
+/* action blocks are clickable in edit mode */
+.track .seg.editable { cursor: pointer; }
+
+/* pending in/out preview band on the action lane */
+#selBand {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px dashed rgba(255, 255, 255, 0.65);
+  border-radius: 5px;
+  pointer-events: none;
+  z-index: 2;
+}

@@ -21,6 +21,21 @@ const activeLabelEl = document.getElementById('activeLabel');
 const GRASP_COLORS = { left: [0.20, 0.45, 0.95], right: [0.90, 0.25, 0.25] };
 
 const FPS = window.__FPS__ || 30;
+const LABEL_MODE = !!window.__LABEL_MODE__;
+
+// ---- Label-editor DOM (present only in --label mode) ----
+const editor = document.getElementById('editor');
+const edNew = document.getElementById('edNew');
+const edStartInput = document.getElementById('edStart');
+const edEndInput = document.getElementById('edEnd');
+const edSetIn = document.getElementById('edSetIn');
+const edSetOut = document.getElementById('edSetOut');
+const edAction = document.getElementById('edAction');
+const edHand = document.getElementById('edHand');
+const edApply = document.getElementById('edApply');
+const edDelete = document.getElementById('edDelete');
+const edSave = document.getElementById('edSave');
+const edStatus = document.getElementById('edStatus');
 
 // ---------------------------------------------------------------- Three setup
 const scene = new THREE.Scene();
@@ -70,6 +85,13 @@ let grasps = { left: [], right: [] };  // stable-grasp intervals per side
 let activeLabelIdx = -1;       // which label is highlighted right now (-1 none)
 let segEls = [];               // DOM nodes for each action label's colored block
 
+// Label-editing state (label mode only).
+let curIndex = 0;              // index of the loaded sequence (for the save POST)
+let editIdx = -1;              // label being edited (-1 = new / unselected)
+let edStart = null;            // pending in-point (0-indexed frame) or null
+let edEnd = null;              // pending out-point (exclusive frame) or null
+let selBandEl = null;          // translucent band on the action lane (in/out preview)
+
 function clearMeshes() {
   for (const m of meshes) {
     scene.remove(m.mesh);
@@ -79,16 +101,24 @@ function clearMeshes() {
   meshes = [];
 }
 
-function makeMesh(positionsFrame0, faces, colorArr, V, opacity = 1.0) {
+function makeMesh(positionsFrame0, faces, colorArr, V, opacity = 1.0, vertexColors = false) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(positionsFrame0.slice(), 3));
+  if (vertexColors) {
+    // Per-vertex color attribute (filled per frame from the contact heatmap).
+    geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(V * 3), 3));
+  }
   geom.setIndex(new THREE.BufferAttribute(faces, 1));
   geom.computeVertexNormals();
-  const color = new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
+  // With vertexColors the material color is a global multiplier — keep it white
+  // so the per-vertex heatmap shows untinted; otherwise use the flat base color.
+  const color = vertexColors
+    ? new THREE.Color(1, 1, 1)
+    : new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
   const transparent = opacity < 1.0;
   const material = new THREE.MeshStandardMaterial({
     color, roughness: 0.75, metalness: 0.0, side: THREE.DoubleSide,
-    transparent, opacity,
+    transparent, opacity, vertexColors,
     // Don't write depth for translucent meshes so two overlapping objects
     // (true vs. reconstructed) blend instead of one hiding the other.
     depthWrite: !transparent,
@@ -96,6 +126,24 @@ function makeMesh(positionsFrame0, faces, colorArr, V, opacity = 1.0) {
   const mesh = new THREE.Mesh(geom, material);
   scene.add(mesh);
   return mesh;
+}
+
+// Two-hand contact heatmap. Each hand has its own hot color; a vertex is colored
+// by whichever hand's contact value is larger (ties → left), blending from the
+// object's base color (no contact) toward that hand's hot color with the
+// winning value. Writes into out[o..o+2] (0..1 floats).
+const CONTACT_HOT = {
+  left:  new THREE.Color(0.20, 0.55, 1.00),   // blue  → left-hand contact
+  right: new THREE.Color(1.00, 0.30, 0.15),   // red   → right-hand contact
+};
+const _contactTmp = new THREE.Color();
+function writeContactColor(out, o, vLeft, vRight, baseColor) {
+  const l = Math.max(0, Math.min(1, vLeft));
+  const r = Math.max(0, Math.min(1, vRight));
+  const useLeft = l >= r;                       // ties favor left
+  const c = useLeft ? l : r;
+  _contactTmp.copy(baseColor).lerp(useLeft ? CONTACT_HOT.left : CONTACT_HOT.right, c);
+  out[o] = _contactTmp.r; out[o + 1] = _contactTmp.g; out[o + 2] = _contactTmp.b;
 }
 
 // ---------------------------------------------------------------- decode blob
@@ -123,10 +171,15 @@ function buildScene(meta, buffer) {
   const objVertsEntry = arrays.obj_verts;                                // (T, Vo, 3)
   const Vo = objVertsEntry.shape[1];
   const objVerts = viewArray(buffer, objVertsEntry);
+  // Optional per-frame, per-hand contact heatmap (T, 2, Vo) = [left, right].
+  const hasContact = !!meta.has_contact && !!arrays.obj_contact;
+  const objContact = hasContact ? viewArray(buffer, arrays.obj_contact) : null;
   meshes.push({
-    mesh: makeMesh(objVerts.subarray(0, Vo * 3), objFaces, meta.obj_color, Vo, objOpacity),
+    mesh: makeMesh(objVerts.subarray(0, Vo * 3), objFaces, meta.obj_color, Vo,
+                   objOpacity, hasContact),
     positions: objVerts, V: Vo,
     baseColor: new THREE.Color(...meta.obj_color),
+    contact: objContact,          // (T*2*Vo) flat [left,right] per frame, or null
   });
 
   for (const side of meta.hand_sides) {
@@ -160,6 +213,7 @@ function buildScene(meta, buffer) {
   }
 
   renderTracks();
+  if (LABEL_MODE) { rebindActionSegClicks(); edClear(); }
   frameSceneToBBox();
   setFrame(0);
 }
@@ -214,6 +268,127 @@ function renderTracks() {
   }
 }
 
+// ---------------------------------------------------------------- label editor
+// All editing behavior is gated behind LABEL_MODE; in plain view mode these are
+// inert (the editor panel stays hidden and the hooks below are never called).
+
+// Mark each action block as editable (cursor + hit-testing). Selection itself is
+// handled in the #scrub pointerdown handler, which owns pointer capture and must
+// intercept the press before it becomes a scrub (a per-segment click never fires
+// once #scrub captures the pointer). segEls[i] corresponds to labels[i].
+function rebindActionSegClicks() {
+  segEls.forEach((el) => el.classList.add('editable'));
+}
+
+// Translucent band on the action lane showing the pending [in, out) range.
+function renderSelectionBand() {
+  if (!selBandEl) return;
+  if (edStart == null || edEnd == null || edEnd <= edStart || nframes <= 0) {
+    selBandEl.style.display = 'none';
+    return;
+  }
+  selBandEl.style.display = 'block';
+  selBandEl.style.left = (edStart / nframes) * 100 + '%';
+  selBandEl.style.width = ((edEnd - edStart) / nframes) * 100 + '%';
+}
+
+// Reset the editor to a fresh (unselected) interval.
+function edClear() {
+  editIdx = -1; edStart = null; edEnd = null;
+  edStartInput.value = ''; edEndInput.value = '';
+  edAction.value = ''; edHand.value = 'both';
+  renderSelectionBand();
+}
+
+// Populate the editor from an existing label.
+function edLoadFrom(i) {
+  const l = labels[i];
+  if (!l) return;
+  editIdx = i; edStart = l.start; edEnd = l.end;
+  edStartInput.value = l.start; edEndInput.value = l.end;
+  edAction.value = l.action || ''; edHand.value = l.hand;
+  edStatus.textContent = `editing #${i}`;
+  renderSelectionBand();
+}
+
+// Read the current In/Out numeric inputs into edStart/edEnd (null if blank).
+function edSyncFromInputs() {
+  const s = parseInt(edStartInput.value, 10);
+  const e = parseInt(edEndInput.value, 10);
+  edStart = Number.isInteger(s) ? s : null;
+  edEnd = Number.isInteger(e) ? e : null;
+  renderSelectionBand();
+}
+
+function wireEditor() {
+  editor.hidden = false;
+
+  // Selection band lives inside the action lane (parent of #segAction).
+  selBandEl = document.createElement('div');
+  selBandEl.id = 'selBand';
+  selBandEl.style.display = 'none';
+  segAction.parentElement.appendChild(selBandEl);
+
+  edNew.onclick = () => { edClear(); edStatus.textContent = 'new interval'; };
+
+  edSetIn.onclick = () => {
+    edStart = frameIdx; edStartInput.value = frameIdx; renderSelectionBand();
+  };
+  // Out-point is exclusive: the playhead frame is the first EXCLUDED frame, so
+  // the interval is [in, playhead). This matches the file's [start, end) form.
+  edSetOut.onclick = () => {
+    edEnd = frameIdx; edEndInput.value = frameIdx; renderSelectionBand();
+  };
+  edStartInput.addEventListener('change', edSyncFromInputs);
+  edEndInput.addEventListener('change', edSyncFromInputs);
+
+  // Add or update the interval in the local labels array (staged, not yet saved).
+  edApply.onclick = () => {
+    edSyncFromInputs();
+    const s = edStart, e = edEnd;
+    const hand = edHand.value, action = edAction.value.trim();
+    if (!(Number.isInteger(s) && Number.isInteger(e) && 0 <= s && s < e && e <= nframes)) {
+      edStatus.textContent = `bad range (need 0<=in<out<=${nframes})`;
+      return;
+    }
+    if (!action) { edStatus.textContent = 'action required'; return; }
+    const rec = { start: s, end: e, hand, action };
+    if (editIdx >= 0) labels[editIdx] = rec; else labels.push(rec);
+    labels.sort((a, b) => (a.start - b.start) || (a.end - b.end));
+    renderTracks(); rebindActionSegClicks(); applyLabelHighlight(frameIdx);
+    edStatus.textContent = 'staged (unsaved)';
+    edClear();
+  };
+
+  edDelete.onclick = () => {
+    if (editIdx < 0) { edStatus.textContent = 'nothing selected'; return; }
+    labels.splice(editIdx, 1);
+    renderTracks(); rebindActionSegClicks(); applyLabelHighlight(frameIdx);
+    edClear();
+    edStatus.textContent = 'deleted (unsaved)';
+  };
+
+  // Save the whole track: full-replacement POST; adopt the canonical re-parse.
+  edSave.onclick = async () => {
+    edStatus.textContent = 'saving…';
+    try {
+      const resp = await fetch(`/api/labels/${curIndex}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labels }),
+      });
+      const j = await resp.json();
+      if (!resp.ok || !j.ok) throw new Error(j.error || `HTTP ${resp.status}`);
+      labels = j.labels;
+      renderTracks(); rebindActionSegClicks(); applyLabelHighlight(frameIdx);
+      edStatus.textContent = 'saved ✓';
+    } catch (err) {
+      edStatus.textContent = 'save failed: ' + err.message;
+      console.error(err);
+    }
+  };
+}
+
 // Move the playhead line to frame t's horizontal position within the lanes.
 function updatePlayhead(t) {
   const frac = nframes > 1 ? t / (nframes - 1) : 0;
@@ -242,7 +417,12 @@ function applyLabelHighlight(t) {
   activeLabelIdx = idx;
 
   if (idx < 0) {
-    for (const m of meshes) m.mesh.material.color.copy(m.baseColor);
+    // Contact meshes use vertex colors; keep their material color white (a
+    // neutral multiplier) so the per-vertex heatmap is shown untinted.
+    for (const m of meshes) {
+      if (m.contact) m.mesh.material.color.setRGB(1, 1, 1);
+      else m.mesh.material.color.copy(m.baseColor);
+    }
     activeLabelEl.textContent = '';
     return;
   }
@@ -251,6 +431,7 @@ function applyLabelHighlight(t) {
   const c = labelColors[lab.hand] || [0.6, 0.6, 0.6];
   const hi = new THREE.Color(c[0], c[1], c[2]);
   for (const m of meshes) {
+    if (m.contact) continue;   // leave the contact heatmap unmodified
     // Blend base color toward the label color so shapes stay readable.
     m.mesh.material.color.copy(m.baseColor).lerp(hi, 0.6);
   }
@@ -296,6 +477,18 @@ function setFrame(t) {
     attr.array.set(src);
     attr.needsUpdate = true;
     m.mesh.geometry.computeVertexNormals();
+    // Refresh the two-hand contact heatmap for this frame, if present. The flat
+    // contact array is (T, 2, Vo): per frame a left block then a right block.
+    if (m.contact) {
+      const cattr = m.mesh.geometry.getAttribute('color');
+      const lBase = t * 2 * m.V;       // left  block for frame t
+      const rBase = lBase + m.V;       // right block for frame t
+      for (let i = 0; i < m.V; i++) {
+        writeContactColor(cattr.array, i * 3,
+          m.contact[lBase + i], m.contact[rBase + i], m.baseColor);
+      }
+      cattr.needsUpdate = true;
+    }
   }
   applyLabelHighlight(t);
   updatePlayhead(t);
@@ -326,6 +519,7 @@ function setPlaying(p) {
 // ---------------------------------------------------------------- data loading
 async function loadSequence(index) {
   loading = true;
+  curIndex = index;
   statusEl.textContent = 'loading sequence…';
   statusEl.classList.add('loading');
   try {
@@ -352,9 +546,16 @@ playBtn.addEventListener('click', () => setPlaying(!playing));
 
 // Spacebar toggles play/pause (unless typing in the sequence dropdown, whose
 // own keyboard behaviour we leave alone).
+// Inputs that consume the spacebar for typing — don't toggle playback for them.
+const spaceGuardEls = new Set([seqSelect]);
+if (LABEL_MODE) {
+  spaceGuardEls.add(edAction);
+  spaceGuardEls.add(edStartInput);
+  spaceGuardEls.add(edEndInput);
+}
 window.addEventListener('keydown', (e) => {
   if (e.code !== 'Space' && e.key !== ' ') return;
-  if (document.activeElement === seqSelect) return;
+  if (spaceGuardEls.has(document.activeElement)) return;
   e.preventDefault();           // stop the page from scrolling
   if (nframes > 0) setPlaying(!playing);
 });
@@ -377,6 +578,17 @@ function frameFromEvent(e) {
 
 scrub.addEventListener('pointerdown', (e) => {
   if (nframes <= 0) return;
+  // In label mode, a press that lands on an editable action block selects that
+  // label for editing instead of scrubbing. #scrub owns pointerdown + pointer
+  // capture, so a segment-level handler can't win on its own — we must bail here
+  // (a plain .onclick would never fire once #scrub captures the pointer).
+  if (LABEL_MODE) {
+    const seg = e.target.closest('.seg.editable');
+    if (seg && segEls.includes(seg)) {
+      edLoadFrom(segEls.indexOf(seg));
+      return;   // don't start scrubbing
+    }
+  }
   scrubbing = true;
   wasPlayingBeforeScrub = playing;
   setPlaying(false);
@@ -407,6 +619,7 @@ nextBtn.addEventListener('click', () => selectAndLoad(parseInt(seqSelect.value, 
 
 // ---------------------------------------------------------------- boot
 resize();
+if (LABEL_MODE) wireEditor();
 requestAnimationFrame(animate);
 if (seqSelect.options.length > 0) {
   loadSequence(parseInt(seqSelect.value, 10));

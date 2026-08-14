@@ -16,7 +16,8 @@ from omegaconf import OmegaConf
 
 from hoidata.dataloaders.action_dataset import ObjectModel
 from hoidata.dataloaders.grab_dataset import (
-    MotionGRAB, TransitionMotionGRAB, StableGraspGRAB)
+    MotionGRAB, TransitionMotionGRAB, BimanualTransitionMotionGRAB,
+    StableGraspGRAB)
 from hoidata.dataloaders.arctic_dataset import MotionARCTIC, StableGraspARCTIC
 from hoidata.utils.hand_proc import ManoLayerWrapper
 from hoidata.utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
@@ -386,6 +387,44 @@ def build_transition_dataset(cfg, split: str = "test", aug_p=None):
     return ds, lhand_layer, rhand_layer
 
 
+def build_bimanual_transition_dataset(cfg, split: str = "test", aug_p=None):
+    """Build the MANO layers and a :class:`BimanualTransitionMotionGRAB` dataset.
+
+    Like :func:`build_transition_dataset` but the two hands are merged per sequence
+    into a grasp-count timeline, so windows are 0↔1↔2 count transitions
+    (types ``01/02/10/12/20/21``) rather than per-hand ``01/10/11``.
+    Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+
+    if aug_p is None:
+        aug_p = cfg.get("aug_p", 0.0)
+
+    ds = BimanualTransitionMotionGRAB(
+        data_path=cfg.data_path,
+        data_obj_pc_path=cfg.data_obj_pc_path,
+        text_json=cfg.text_json,
+        max_nframes=-1,
+        task="evaluate",
+        split=split,
+        lhand_layer=lhand_layer,
+        rhand_layer=rhand_layer,
+        min_len=cfg.get("transition_min_len", 10),
+        max_len=cfg.get("transition_max_len", 100),
+        aug_p=aug_p,
+    )
+    return ds, lhand_layer, rhand_layer
+
+
 def build_stable_grasp_dataset(cfg, dataset_name: str, split: str = "test"):
     """Build the MANO layers and a stable-grasp dataset (one item per grasp).
 
@@ -462,6 +501,79 @@ def pose_transition_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) ->
         "nframes": item["n_frames"],
         "obj_name": item["obj_name"],
         # Label carries object / hand / transition-type (see transition_label).
+        "action_name": ds.transition_label(index),
+        "labels": [],
+        "subject": "",
+        "grasps": {"left": [], "right": []},
+    }
+
+
+def pose_bimanual_transition_sample(
+        cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Pose one bimanual transition window from a :class:`BimanualTransitionMotionGRAB`.
+
+    The item exposes each posed hand separately as ``x_lhand`` / ``x_rhand``
+    (each ``(Tt, D)`` or ``None``); ``item["hand_sides"]`` lists which are present.
+    Each hand is posed independently and the world-space vertex blocks are
+    concatenated along the vertex axis into ``(Tt, 778*H, 3)`` — the layout the
+    viewer's ``build_hand_mesh`` expects (it slices 778-vertex blocks per side).
+    The object is posed directly from the item's sliced ``x_object`` window,
+    exactly like the unimanual poser.
+    """
+    from hoidata.utils.proc import transform_xdata_to_verts
+
+    item = ds[index]
+    sides = list(item["hand_sides"])
+
+    hand_blocks = []
+    for side in sides:
+        layer = lhand_layer if side == "left" else rhand_layer
+        xh = np.asarray(item["x_lhand" if side == "left" else "x_rhand"],
+                        dtype=np.float32)                                  # (Tt, D)
+        verts = transform_xdata_to_verts(xh, layer).astype(np.float32)     # (Tt,778,3)
+        hand_blocks.append(verts)
+    hand_verts = np.concatenate(hand_blocks, axis=1)  # (Tt, 778*H, 3)
+
+    # Object: rigid GRAB mesh posed per frame from the sliced x_object window.
+    obj_model = ObjectModel(cfg.data_obj_pc_path)
+    _, obj_pc, _obj_pc_normal, obj_path = obj_model(item["obj_name"])
+    mesh = trimesh.load(osp.join(cfg.obj_root, obj_path), process=False)
+    mesh_verts_canon = np.asarray(mesh.vertices, dtype=np.float32)          # (Vo,3)
+    obj_verts_t = process_obj_result(
+        proc_torch_cuda(mesh_verts_canon),
+        proc_torch_cuda(item["x_object"]),
+        "grab",
+    )
+    obj_verts = proc_numpy(obj_verts_t)
+    obj_faces = np.asarray(mesh.faces)
+
+    # Per-frame, per-hand contact map over the window, colored on the full-res
+    # mesh: each mesh vertex takes the contact of its nearest sampled point.  The
+    # dataset returns per-hand maps (Tt, 2, O) = [left, right]; both are kept so
+    # the viewer can color the two hands' contact distinctly (and pick the larger
+    # where a vertex touches both).  The canonical-space nearest-sampled-point map
+    # is frame-invariant (mesh and pc move rigidly together), so compute it once.
+    contact_lr = ds._window_contact(
+        item["seq_idx"], item["start_frame"], item["end_frame"], sides)     # (Tt,2,O)
+    from scipy.spatial import cKDTree
+    nn_idx = cKDTree(obj_pc.astype(np.float32)).query(mesh_verts_canon)[1]   # (Vo,)
+    obj_contact = contact_lr[:, :, nn_idx].astype(np.float32)               # (Tt,2,Vo)
+
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    return {
+        "hand_verts": hand_verts,
+        "hand_faces": hand_faces,
+        "hand_sides": sides,
+        "obj_verts": obj_verts,
+        "obj_faces": obj_faces,
+        "obj_contact": obj_contact,          # (Tt, 2, Vo) per-frame per-hand [L,R] contact
+        "nframes": item["n_frames"],
+        "obj_name": item["obj_name"],
+        # Label carries object / driving hand(s) / transition-type.
         "action_name": ds.transition_label(index),
         "labels": [],
         "subject": "",

@@ -60,10 +60,36 @@
       <span><i class="sw" style="background:#e64040"></i>R grasp</span>
       <span id="activeLabel"></span>
     </div>
+
+    <!-- Action-label editor (shown only with --label). Click an action block to
+         load it here, or ＋ New for a fresh interval. Set In/Out capture the
+         playhead frame; Save writes the whole track to the working-copy file. -->
+    <div id="editor" hidden>
+      <div class="ed-row">
+        <button id="edNew" title="Start a new interval">＋ New</button>
+        <label>In <input id="edStart" type="number" min="0" step="1"></label>
+        <button id="edSetIn" title="Set in-point to the playhead frame">Set In</button>
+        <label>Out <input id="edEnd" type="number" min="1" step="1"></label>
+        <button id="edSetOut" title="Set out-point to the playhead frame (exclusive)">Set Out</button>
+      </div>
+      <div class="ed-row">
+        <input id="edAction" type="text" placeholder="action label (e.g. grasp)">
+        <select id="edHand" title="Hand type">
+          <option value="left">left</option>
+          <option value="right">right</option>
+          <option value="both" selected>both</option>
+        </select>
+        <button id="edApply" title="Add or update this interval (staged)">Add / Update</button>
+        <button id="edDelete" title="Delete the selected interval (staged)">Delete</button>
+        <button id="edSave" class="primary" title="Save all labels to the description file">Save to file</button>
+        <span id="edStatus"></span>
+      </div>
+    </div>
   </div>
 
   <script>
     window.__FPS__ = {{ fps }};
+    window.__LABEL_MODE__ = {{ 'true' if label_mode else 'false' }};
   </script>
   <script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
 </body>

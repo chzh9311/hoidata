@@ -53,6 +53,26 @@
             ]
         },
         {
+            // Launch the web viewer on the bimanual (merged-hand) transition
+            // dataset.  Set breakpoints in grab_dataset.py ->
+            // BimanualTransitionMotionGRAB._bimanual_transitions and in
+            // o3d_visualizer.py -> pose_bimanual_transition_sample.
+            "name": "Debug bimanual transition viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": [
+                "--config", "configs/grab.yaml",
+                "--split", "test",
+                "--bimanual",
+                "--aug-p", "0"
+            ]
+        },
+        {
             // Same viewer, but let you type extra args at launch (e.g. a
             // different --split / --port) via the arg picker.
             "name": "Debug wrist-aligned viewer (pick args)",
