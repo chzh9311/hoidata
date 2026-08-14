@@ -48,11 +48,11 @@ import pandas as pd
 import torch
 import tqdm
 from pytorch3d.ops import knn_gather, knn_points
-from pytorch3d.transforms import so3_rotation_angle
+from pytorch3d.transforms import (
+    axis_angle_to_matrix, rotation_6d_to_matrix, so3_rotation_angle)
 import torch.nn.functional as F
 
 from hoidata.utils.proc import proc_numpy, proc_torch_cuda
-from hoidata.utils.rot import axis_angle_to_rotmat, rot6d_to_rotmat
 from hoidata.vis.o3d_visualizer import build_dataset, pose_sample
 
 LEFT = "left"
@@ -477,13 +477,13 @@ def _sequence_global_rotmats(ds, index, item, device="cuda"):
     nframes = int(item["nframes"])
 
     obj_rotvec = proc_torch_cuda(item["obj_traj"][:nframes, 3:6])  # (T, 3)
-    obj_rotmat = axis_angle_to_rotmat(obj_rotvec).to(device)  # (T, 3, 3)
+    obj_rotmat = axis_angle_to_matrix(obj_rotvec).to(device)  # (T, 3, 3)
 
     hand_rotmat = {}
     for side in item["hand_sides"]:
         x_hand = ds.x_lhand[index] if side == LEFT else ds.x_rhand[index]
         rot6d = proc_torch_cuda(x_hand[:nframes, 3:9])  # (T, 6) global rot6d
-        hand_rotmat[side] = rot6d_to_rotmat(rot6d).to(device)  # (T, 3, 3)
+        hand_rotmat[side] = rotation_6d_to_matrix(rot6d).to(device)  # (T, 3, 3)
     return obj_rotmat, hand_rotmat
 
 

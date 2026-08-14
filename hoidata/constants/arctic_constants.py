@@ -4,7 +4,9 @@ Source: Text2HOI (https://github.com/JunukCha/Text2HOI.git)
   constants/arctic_constants.py  (object/action/verb lists)
 
 ARCTIC objects are *articulated* (a top + bottom part joined by a 1-DoF revolute
-joint).  The object x-data is 10-D: trans(3) + rot6d(6) + articulation_angle(1).
+joint).  The object x-data is 10-D: trans(3) + rot6d(6) + articulation_angle(1),
+where rot6d is pytorch3d's convention (first two *rows* of R) — see
+``hoidata.utils.proc.transform_obj_to_xdata``.
 
 Splits (val/test object held-out sets) do not exist upstream; the lists below are
 chosen here so the action-classify / evaluate tasks have disjoint object splits —

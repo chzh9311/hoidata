@@ -31,7 +31,26 @@ import pickle
 
 from hoidata.utils.frame import get_valid_mask
 from hoidata.utils.proc import get_contact_map, process_dist_map, transform_xdata_to_joints
-from hoidata.utils.rot import rot6d_to_rotmat, rotmat_to_rot6d
+from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
+
+
+#: rot6d convention stamped into every preprocessed data.npz.  Caches written
+#: before the pytorch3d migration carry no ``rot_repr`` key and store rot6d as
+#: the first two *columns* of R, which ``rotation_6d_to_matrix`` would silently
+#: misread — hence the hard failure in ``_check_rot_repr``.
+ROT_REPR = "pytorch3d_6d"
+
+
+def _check_rot_repr(data, data_path):
+    """Reject a preprocessed .npz whose rot6d convention is not ``ROT_REPR``."""
+    repr_name = str(data["rot_repr"]) if "rot_repr" in data.files else None
+    if repr_name != ROT_REPR:
+        raise RuntimeError(
+            f"{data_path} has rot_repr={repr_name!r}, expected {ROT_REPR!r}.\n"
+            "This cache predates the pytorch3d 6D-rotation migration and its "
+            "x_lhand / x_rhand / x_obj would be silently misinterpreted.\n"
+            f"Convert it in place with:  python -m scripts.migrate_rot6d {data_path}"
+        )
 
 
 def _seed_worker(worker_id):
@@ -57,6 +76,8 @@ def compute_xdata_delta(xdata):
 
     x-data layout: ``[:, :3]`` translation, ``[:, 3:]`` rot6d for one or more
     rotations (16 joints for hands → 96, one rotation for the object → 6).
+    rot6d is pytorch3d's convention (first two *rows* of R); see
+    ``hoidata.utils.proc.transform_hand_to_xdata``.
 
     - translation delta: ``trans[t+1] - trans[t]``.
     - rotation delta: computed in rotation space, NOT by subtracting 6D.  For
@@ -80,12 +101,12 @@ def compute_xdata_delta(xdata):
 
     trans_delta = trans[1:] - trans[:-1]                       # (T-1, 3)
 
-    rot6d_t = torch.from_numpy(rot6d).reshape(T * n_rot, 6)
-    rotmat = rot6d_to_rotmat(rot6d_t).reshape(T, n_rot, 3, 3)  # (T, n_rot, 3, 3)
+    rot6d_t = torch.from_numpy(rot6d).reshape(T, n_rot, 6)
+    rotmat = rotation_6d_to_matrix(rot6d_t)                    # (T, n_rot, 3, 3)
     R_cur = rotmat[:-1]                                        # R_t
     R_nxt = rotmat[1:]                                         # R_{t+1}
     R_delta = R_nxt @ R_cur.transpose(-1, -2)                  # world-frame: R_{t+1} @ R_t^T
-    rot6d_delta = rotmat_to_rot6d(R_delta.reshape(-1, 3, 3)).reshape(T - 1, n_rot * 6)
+    rot6d_delta = matrix_to_rotation_6d(R_delta).reshape(T - 1, n_rot * 6)
     rot6d_delta = rot6d_delta.cpu().numpy().astype(np.float32)
 
     return np.concatenate([trans_delta, rot6d_delta], axis=1)  # (T-1, D)
@@ -242,6 +263,7 @@ class MotionDatasetBase(Dataset):
         start_time = time.time()
         print(f"Start to read data ({self.__class__.__name__})!!!")
         with np.load(data_path, allow_pickle=True) as data:
+            _check_rot_repr(data, data_path)
             self._load_data(data, task, split)
 
         if task != "action_classify":

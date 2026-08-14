@@ -50,7 +50,7 @@ import tqdm
 import trimesh
 
 from hoidata.utils.hand_proc import ManoLayerWrapper
-from hoidata.dataloaders.action_dataset import ObjectModel
+from hoidata.dataloaders.action_dataset import ROT_REPR, ObjectModel
 from hoidata.preprocess.preprocess_arctic import load_stable_grasps
 from hoidata.utils.frame import align_frame
 from hoidata.utils.proc import (
@@ -64,7 +64,7 @@ from hoidata.utils.proc import (
     transform_obj_to_xdata,
     transform_xdata_to_joints,
 )
-from hoidata.utils.rot import axis_angle_to_rotmat
+from pytorch3d.transforms import axis_angle_to_matrix
 from hoidata.constants.grab_constants import (
     grab_obj_name,
     object_proc,
@@ -236,7 +236,7 @@ def preprocessing_data(cfg):
 
         obj_glob_ori = proc_torch_cuda(obj_glob_ori)
         obj_trans = proc_torch_cuda(obj_trans)
-        obj_rotmat = axis_angle_to_rotmat(obj_glob_ori)
+        obj_rotmat = axis_angle_to_matrix(obj_glob_ori)
         obj_extmat = torch.cat([obj_rotmat, obj_trans.unsqueeze(2)], dim=2)
 
         _, obj_pc, _, _ = object_model(obj_name)
@@ -330,6 +330,7 @@ def preprocessing_data(cfg):
     os.makedirs(osp.dirname(cfg.data_path), exist_ok=True)
     np.savez(
         cfg.data_path,
+        rot_repr=np.array(ROT_REPR),   # rot6d convention stamp, checked on load
         **final_dict,
         **{k: _to_array(k, v) for k, v in extra.items()},
     )

@@ -27,7 +27,8 @@ from omegaconf import OmegaConf
 import torch
 
 from hoidata.utils.hand_proc import ManoLayerWrapper
-from hoidata.utils.rot import rot6d_to_rotmat, rotmat_to_rot6d, vee_vector, cross_matrix, axis_angle_to_rotmat
+from pytorch3d.transforms import axis_angle_to_matrix, rotation_6d_to_matrix
+from pytorch3d.transforms.so3 import hat_inv
 from hoidata.dataloaders.grab_dataset import (
     StableGraspGRABDataModule, TransitionMotionGRABDataModule)
 from hoidata.dataloaders.arctic_dataset import StableGraspARCTICDataModule
@@ -96,7 +97,7 @@ def avg_rotation_axis(Rs):
 
     Returns a unit ``(3,)`` tensor.
     """
-    sinaa = vee_vector((Rs - Rs.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
+    sinaa = hat_inv((Rs - Rs.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
     M = sinaa.transpose(0, 1) @ sinaa  # (3, 3), symmetric PSD
     # eigh returns eigenvalues ascending, so the last column is the dominant axis.
     _, evecs = torch.linalg.eigh(M)
@@ -117,18 +118,19 @@ def analyze(datasets):
         for i, it in enumerate(ds):
             print(f"    ds[{i}]: x_hand={it['x_hand'].shape} x_object={it['x_object'].shape} "
                   f"obj={it['obj_name']} n_frames={it['n_frames']}")
-            # Datasets yield numpy; the rot utils are torch, so convert at the boundary.
+            # Datasets yield numpy; the pytorch3d converters are torch, so
+            # convert at the boundary.
             x_object = torch.from_numpy(it['x_object']).float()  # (T, 9|10)
             x_hand = torch.from_numpy(it['x_hand']).float()      # (T, 99)
 
             obj_rot = x_object[:, 3:9]  # (T, 6) rot6d
-            obj_R = rot6d_to_rotmat(obj_rot)  # (T, 3, 3)
+            obj_R = rotation_6d_to_matrix(obj_rot)  # (T, 3, 3)
             obj_t = x_object[:, :3]  # (T, 3) translation
             wrist_rot = x_hand[:, 3:9]  # (T, 6) rot6d
-            wrist_R = rot6d_to_rotmat(wrist_rot)  # (T, 3, 3)
+            wrist_R = rotation_6d_to_matrix(wrist_rot)  # (T, 3, 3)
             wrist_t = x_hand[:, :3]  # (T, 3) translation
             obj2wrist_R = wrist_R.transpose(1, 2) @ obj_R  # (T, 3, 3)
-            sinaa = vee_vector((obj2wrist_R - obj2wrist_R.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
+            sinaa = hat_inv((obj2wrist_R - obj2wrist_R.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
             M = sinaa.transpose(0, 1) @ sinaa  # (3, 3), symmetric PSD
             # eigh returns eigenvalues ascending, so the last column is the dominant axis.
             _, evecs = torch.linalg.eigh(M)
@@ -140,7 +142,7 @@ def analyze(datasets):
             sin_a = sinaa @ axis  # (T,)
             angle = torch.atan2(sin_a, cos_a)  # (T,) signed, sign tied to `axis`
             recovered_aa = angle.unsqueeze(-1) * axis  # (T, 3) axis-angle per frame
-            recovered_R = axis_angle_to_rotmat(recovered_aa)  # (T, 3, 3) rotation matrix of the average rotation
+            recovered_R = axis_angle_to_matrix(recovered_aa)  # (T, 3, 3) rotation matrix of the average rotation
             delta_R = obj2wrist_R.transpose(1, 2) @ recovered_R  # (T, 3, 3) difference from average rotation
             # Per-frame residual angle; clamp guards acos against |cos|>1 from roundoff.
             cos_d = (torch.diagonal(delta_R, dim1=1, dim2=2).sum(-1) - 1) / 2  # (T,)

@@ -15,7 +15,7 @@ from scipy.spatial.distance import cdist
 sys.path = [".."] + sys.path
 
 from hoidata.utils.proc import thing2dev, pad_tensor_list
-from hoidata.utils.rot import axis_angle_to_quaternion, quaternion_apply
+from pytorch3d.transforms import axis_angle_to_quaternion, quaternion_apply
 
 
 class xdict(dict):

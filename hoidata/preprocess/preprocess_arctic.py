@@ -46,7 +46,7 @@ import tqdm
 import trimesh
 
 from hoidata.utils.hand_proc import ManoLayerWrapper
-from hoidata.dataloaders.action_dataset import ObjectModel
+from hoidata.dataloaders.action_dataset import ROT_REPR, ObjectModel
 from hoidata.utils.object_tensors import ObjectTensors
 from hoidata.utils.frame import align_frame
 from hoidata.utils.proc import (
@@ -64,7 +64,7 @@ from hoidata.utils.proc_arctic import (
     process_text,
     processe_params,
 )
-from hoidata.utils.rot import axis_angle_to_rotmat
+from pytorch3d.transforms import axis_angle_to_matrix
 from hoidata.constants.arctic_constants import (
     arctic_obj_name,
     subj_list,
@@ -350,7 +350,7 @@ def preprocessing_data(cfg):
 
                     obj_rot_th = proc_torch_cuda(obj_rots)
                     obj_trans_th = proc_torch_cuda(obj_trans) / 1000  # mm → m
-                    obj_rotmat_th = axis_angle_to_rotmat(obj_rot_th)
+                    obj_rotmat_th = axis_angle_to_matrix(obj_rot_th)
                     obj_extmat_th = torch.cat(
                         [obj_rotmat_th, obj_trans_th.unsqueeze(2)], dim=2)
 
@@ -433,7 +433,7 @@ def preprocessing_data(cfg):
                         # Object extrinsic matrix for contact computation.
                         obj_rot_th = proc_torch_cuda(obj_rots[sf:ef])
                         obj_trans_th = proc_torch_cuda(obj_trans[sf:ef]) / 1000   # mm → m
-                        obj_rotmat_th = axis_angle_to_rotmat(obj_rot_th)
+                        obj_rotmat_th = axis_angle_to_matrix(obj_rot_th)
                         obj_extmat_th = torch.cat(
                             [obj_rotmat_th, obj_trans_th.unsqueeze(2)], dim=2)
 
@@ -529,6 +529,7 @@ def preprocessing_data(cfg):
     os.makedirs(osp.dirname(cfg.data_path), exist_ok=True)
     np.savez(
         cfg.data_path,
+        rot_repr=np.array(ROT_REPR),   # rot6d convention stamp, checked on load
         **final_dict,
         **{k: _to_array(k, v) for k, v in extra.items()},
     )

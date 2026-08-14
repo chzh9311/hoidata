@@ -8,12 +8,13 @@ import numpy as np
 import torch
 from pytorch3d.ops.knn import knn_points
 
-from hoidata.utils.rot import (
-    axis_angle_to_rot6d,
-    rotmat_to_rot6d,
-    rot6d_to_rotmat,
-    quaternion_apply,
+from pytorch3d.transforms import (
+    axis_angle_to_matrix,
     axis_angle_to_quaternion,
+    matrix_to_axis_angle,
+    matrix_to_rotation_6d,
+    quaternion_apply,
+    rotation_6d_to_matrix,
 )
 
 
@@ -36,11 +37,11 @@ def xdata_delta_torch(xdata):
 
     trans_delta = trans[..., 1:, :] - trans[..., :-1, :]            # (..., T-1, 3)
 
-    rotmat = rot6d_to_rotmat(rot6d.reshape(-1, 6)).reshape(*lead, T, n_rot, 3, 3)
+    rotmat = rotation_6d_to_matrix(rot6d.reshape(*lead, T, n_rot, 6))
     R_cur = rotmat[..., :-1, :, :, :]                              # R_t
     R_nxt = rotmat[..., 1:, :, :, :]                               # R_{t+1}
     R_delta = R_nxt @ R_cur.transpose(-1, -2)                      # R_{t+1} @ R_t^T
-    rot6d_delta = rotmat_to_rot6d(R_delta.reshape(-1, 3, 3)).reshape(*lead, T - 1, n_rot * 6)
+    rot6d_delta = matrix_to_rotation_6d(R_delta).reshape(*lead, T - 1, n_rot * 6)
 
     return torch.cat([trans_delta, rot6d_delta], dim=-1)           # (..., T-1, D)
 
@@ -87,9 +88,17 @@ def proc_torch_frame(l):
 # ---------------------------------------------------------------------------
 
 def transform_hand_to_xdata(trans, pose):
-    """Convert MANO trans + axis-angle pose to x-data representation (trans + rot6d)."""
+    """Convert MANO trans + axis-angle pose to x-data representation (trans + rot6d).
+
+    rot6d follows pytorch3d's convention (``matrix_to_rotation_6d``): the first
+    two *rows* of R, flattened as ``[R00,R01,R02,R10,R11,R12]``.  This is the
+    on-disk format of ``x_lhand`` / ``x_rhand`` in ``data.npz``; caches written
+    before the pytorch3d migration used a different (column-major) layout and
+    must be converted with ``scripts/migrate_rot6d.py``.
+    """
     nframes = pose.shape[0]
-    rot6d = axis_angle_to_rot6d(pose.reshape(-1, 3)).reshape(nframes, 16 * 6)
+    rot6d = matrix_to_rotation_6d(
+        axis_angle_to_matrix(pose.reshape(-1, 3))).reshape(nframes, 16 * 6)
     xdata = torch.cat([trans, rot6d], dim=1)
     return proc_numpy(xdata)
 
@@ -103,24 +112,27 @@ def transform_xdata_to_joints(xdata, hand_layer):
 
 def transform_xdata_to_verts(xdata, hand_layer):
     """Convert x-data (trans + rot6d) to (T, 778, 3) world-space MANO vertices."""
-    from hoidata.utils.rot import rot6d_to_axis_angle
     xdata = proc_torch_cuda(xdata)
     nframes = xdata.shape[0]
     pred_trans = xdata[:, :3]
     pred_rot6d = xdata[:, 3:]
-    pred_pose = rot6d_to_axis_angle(pred_rot6d.reshape(-1, 6)).reshape(nframes, 48)
+    pred_pose = matrix_to_axis_angle(
+        rotation_6d_to_matrix(pred_rot6d.reshape(-1, 6))).reshape(nframes, 48)
     betas = torch.zeros(nframes, 10, device=xdata.device)
     out = hand_layer(pred_pose, betas, pred_trans)
     return proc_numpy(out.vertices)
 
 
 def transform_obj_to_xdata(obj_extmat):
-    """Convert (T, 3, 4) object extrinsic matrices to (T, 9) x-data (trans + rot6d)."""
+    """Convert (T, 3, 4) object extrinsic matrices to (T, 9) x-data (trans + rot6d).
+
+    rot6d follows pytorch3d's convention — see ``transform_hand_to_xdata``.
+    """
     orl = obj_extmat  # already a cuda tensor from preprocessing
     obj_rotmat = orl[:, :3, :3]
     obj_trans = orl[:, :3, 3]
     nframes = obj_rotmat.shape[0]
-    rot6d = rotmat_to_rot6d(obj_rotmat).reshape(nframes, 6)
+    rot6d = matrix_to_rotation_6d(obj_rotmat).reshape(nframes, 6)
     xdata = torch.cat([obj_trans, rot6d], dim=1)
     return proc_numpy(xdata)
 
@@ -168,8 +180,8 @@ def _get_hand_joints_w_tip(hand_params, hand_layer):
     pred_trans = hand_params[..., :3]
     pred_rot6d = hand_params[..., 3:]
 
-    from hoidata.utils.rot import rot6d_to_axis_angle
-    pred_pose = rot6d_to_axis_angle(pred_rot6d.reshape(-1, 6)).reshape(-1, 48)
+    pred_pose = matrix_to_axis_angle(
+        rotation_6d_to_matrix(pred_rot6d.reshape(-1, 6))).reshape(-1, 48)
     pred_trans_flat = pred_trans.reshape(-1, 3)
     betas = torch.zeros(bs * nframes, 10, device=hand_params.device)
     out = hand_layer(pred_pose, betas, pred_trans_flat)
@@ -333,7 +345,7 @@ def get_transformed_obj_pc(obj_params, obj_pc, dataset_name, obj_top_idx=None):
     bs, nframes = obj_params.shape[:2]
     obj_trans = obj_params[..., :3]
     obj_rot6d = obj_params[..., 3:9]
-    obj_rotmat = rot6d_to_rotmat(obj_rot6d).reshape(bs, nframes, 3, 3)
+    obj_rotmat = rotation_6d_to_matrix(obj_rot6d).reshape(bs, nframes, 3, 3)
     if dataset_name == "arctic" and obj_params.shape[-1] == 10 and obj_top_idx is not None:
         obj_top_idx = obj_top_idx.bool()
         obj_angle = obj_params[..., 9:10]
@@ -358,7 +370,7 @@ def process_obj_result(obj_verts, obj_params, dataset_name, obj_top_idx=None):
     nframes = obj_params.shape[0]
     obj_trans = obj_params[:, :3]
     obj_rot6d = obj_params[:, 3:9]
-    obj_rotmat = rot6d_to_rotmat(obj_rot6d).reshape(-1, 3, 3)
+    obj_rotmat = rotation_6d_to_matrix(obj_rot6d).reshape(-1, 3, 3)
     if dataset_name == "arctic" and obj_params.shape[-1] == 10 and obj_top_idx is not None:
         obj_top_idx = obj_top_idx.bool()
         obj_angle = obj_params[..., 9:10]

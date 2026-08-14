@@ -140,10 +140,10 @@ class MotionARCTIC(MotionDatasetBase):
         GRAB, the rotvec is **not** negated — the ARCTIC articulation/posing path
         (``process_obj_result``) applies R directly (no transpose) on the raw rotvec.
         """
-        from hoidata.utils.rot import rot6d_to_axis_angle
+        from pytorch3d.transforms import matrix_to_axis_angle, rotation_6d_to_matrix
         obj_trans = x_obj[:, :3]
         obj_rotvec = proc_numpy(
-            rot6d_to_axis_angle(proc_torch_cuda(x_obj[:, 3:9]))
+            matrix_to_axis_angle(rotation_6d_to_matrix(proc_torch_cuda(x_obj[:, 3:9])))
         )
         obj_traj = np.concatenate([obj_trans, obj_rotvec], axis=1)  # (T, 6)
         obj_angle = self.x_obj_angle[self._eval_index][:nframes, 0]  # (T,)

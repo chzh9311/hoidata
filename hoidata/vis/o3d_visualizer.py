@@ -176,16 +176,17 @@ def _fit_fixed_axis_motion(R_wrist_frame, t_wrist_frame):
     single-axis assumption.
     """
     import torch
-    from hoidata.utils.rot import vee_vector, axis_angle_to_rotmat
+    from pytorch3d.transforms import axis_angle_to_matrix
+    from pytorch3d.transforms.so3 import hat_inv
 
     R = torch.from_numpy(np.asarray(R_wrist_frame, dtype=np.float32))    # (T,3,3)
     t = torch.from_numpy(np.asarray(t_wrist_frame, dtype=np.float32))    # (T,3)
 
-    sinaa = vee_vector((R - R.transpose(1, 2)) / 2)                      # sin(th)*u
+    sinaa = hat_inv((R - R.transpose(1, 2)) / 2)                      # sin(th)*u
     axis = torch.linalg.eigh(sinaa.transpose(0, 1) @ sinaa)[1][:, -1]    # (3,)
     cos_a = (torch.diagonal(R, dim1=1, dim2=2).sum(-1) - 1) / 2
     angle = torch.atan2(sinaa @ axis, cos_a)                             # (T,)
-    R_rec = axis_angle_to_rotmat(angle.unsqueeze(-1) * axis)             # (T,3,3)
+    R_rec = axis_angle_to_matrix(angle.unsqueeze(-1) * axis)             # (T,3,3)
 
     # Pivot: (I - R_i) t = t_i, rank-2 (axis component unobservable) → gelsd.
     # The system is homogeneous in t — the constant is already implied by the
@@ -228,11 +229,12 @@ def _wrist_origin(x_hand, layer):
     reading ``joints_w_tip[:, 0]`` gives the actual wrist.
     """
     import torch
-    from hoidata.utils.rot import rot6d_to_axis_angle
+    from pytorch3d.transforms import matrix_to_axis_angle, rotation_6d_to_matrix
 
     xd = proc_torch_cuda(np.asarray(x_hand, dtype=np.float32))
     T = xd.shape[0]
-    pose = rot6d_to_axis_angle(xd[:, 3:].reshape(-1, 6)).reshape(T, 48)
+    pose = matrix_to_axis_angle(
+        rotation_6d_to_matrix(xd[:, 3:].reshape(-1, 6))).reshape(T, 48)
     betas = torch.zeros(T, 10, device=xd.device)
     out = layer(pose, betas, xd[:, :3])
     return proc_numpy(out.joints_w_tip[:, 0]).astype(np.float32)
@@ -253,7 +255,7 @@ def pose_wrist_aligned_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0)
     ``resid_angle`` by ``scripts/dof_analysis.py``.
     """
     from hoidata.utils.proc import transform_xdata_to_verts
-    from hoidata.utils.rot import rot6d_to_rotmat
+    from pytorch3d.transforms import rotation_6d_to_matrix
     import torch
 
     item = ds[index]
@@ -274,7 +276,7 @@ def pose_wrist_aligned_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0)
     # joint, so subtracting it would leave the hand off-origin.
     hand_verts = transform_xdata_to_verts(x_hand, layer).astype(np.float32)  # (T,778,3)
     xh = torch.from_numpy(np.asarray(x_hand, dtype=np.float32))
-    wrist_R = proc_numpy(rot6d_to_rotmat(xh[:, 3:9]))                        # (T,3,3)
+    wrist_R = proc_numpy(rotation_6d_to_matrix(xh[:, 3:9]))                        # (T,3,3)
     wrist_o = _wrist_origin(x_hand, layer)                                   # (T,3)
     hand_local = np.einsum('tji,tvj->tvi', wrist_R, hand_verts - wrist_o[:, None])
 
@@ -304,7 +306,7 @@ def pose_wrist_aligned_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0)
     # the wrist frame, so both the fixed-axis fit and the drawing use it
     # directly (plain multiply, no extra transpose).
     xo = torch.from_numpy(np.asarray(x_object, dtype=np.float32))
-    obj_R = proc_numpy(rot6d_to_rotmat(xo[:, 3:9]))                          # R_o (stored)
+    obj_R = proc_numpy(rotation_6d_to_matrix(xo[:, 3:9]))                          # R_o (stored)
     obj_t = np.asarray(x_object[:, :3], dtype=np.float32)
     R_true = np.einsum('tji,tkj->tik', wrist_R, obj_R)                       # R_w^T R_o^T
     t_true = np.einsum('tji,tj->ti', wrist_R, obj_t - wrist_o)

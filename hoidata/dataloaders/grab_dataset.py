@@ -129,10 +129,10 @@ class MotionGRAB(MotionDatasetBase):
 
     def _obj_traj_from_xobj(self, x_obj, nframes):
         # x_obj is (T, 9) = trans(3) + rot6d(6) → trans + rotvec.
-        from hoidata.utils.rot import rot6d_to_axis_angle
+        from pytorch3d.transforms import matrix_to_axis_angle, rotation_6d_to_matrix
         obj_trans = x_obj[:, :3]
         obj_rotvec = proc_numpy(
-            rot6d_to_axis_angle(proc_torch_cuda(x_obj[:, 3:]))
+            matrix_to_axis_angle(rotation_6d_to_matrix(proc_torch_cuda(x_obj[:, 3:])))
         )
         # Use the inverse object rotation R^{-1}: for an axis-angle (rotvec)
         # representation the inverse is simply the negated vector.
@@ -657,7 +657,7 @@ class BimanualTransitionMotionGRAB(TransitionMotionGRAB):
         """
         import torch
         from pytorch3d.structures import Meshes
-        from hoidata.utils.rot import rot6d_to_rotmat, rot6d_to_axis_angle
+        from pytorch3d.transforms import matrix_to_axis_angle, rotation_6d_to_matrix
 
         Tt = b - a
         obj_name = str(self.obj_name[seq_idx])
@@ -678,7 +678,7 @@ class BimanualTransitionMotionGRAB(TransitionMotionGRAB):
         obj_pc_t = torch.as_tensor(obj_pc.astype(np.float32), device=device)        # (O,3)
         obj_norm_t = torch.as_tensor(obj_pc_normal.astype(np.float32), device=device)  # (O,3)
         obj_verts = process_obj_result(obj_pc_t, x_obj, "grab")            # (Tt,O,3)
-        rotmat = rot6d_to_rotmat(x_obj[:, 3:9]).reshape(Tt, 3, 3)          # (Tt,3,3)
+        rotmat = rotation_6d_to_matrix(x_obj[:, 3:9]).reshape(Tt, 3, 3)    # (Tt,3,3)
         # GRAB rotation convention (see process_obj_result "grab" einsum "ij,ki->kj").
         obj_normals = torch.einsum("ni,tij->tnj", obj_norm_t, rotmat)      # (Tt,O,3)
 
@@ -696,7 +696,8 @@ class BimanualTransitionMotionGRAB(TransitionMotionGRAB):
                 device=device)                                            # (Tt,D)
             # MANO FK on the layer's device (a device-following inline of
             # transform_xdata_to_verts, which would otherwise force .cuda()).
-            pose = rot6d_to_axis_angle(xh[:, 3:].reshape(-1, 6)).reshape(Tt, 48)
+            pose = matrix_to_axis_angle(
+                rotation_6d_to_matrix(xh[:, 3:].reshape(-1, 6))).reshape(Tt, 48)
             betas = torch.zeros(Tt, 10, device=device)
             verts = layer(pose, betas, xh[:, :3]).vertices                # (Tt,778,3)
             faces = layer.th_faces.to(device).unsqueeze(0).expand(Tt, -1, -1)
