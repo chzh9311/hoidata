@@ -171,9 +171,10 @@ def _fit_fixed_axis_motion(R_wrist_frame, t_wrist_frame):
     signed angle from ``atan2`` of the trace-cosine and the axis-projected sine,
     and the pivot from the least-squares system ``(I - R_i) t = d_i``.
 
-    Returns ``(R_rec, t_rec, axis, angle, resid_deg)`` where ``R_rec`` (T,3,3)
-    and ``t_rec`` (T,3) are the *reconstructed* wrist-frame object pose under the
-    single-axis assumption.
+    Returns ``(R_rec, t_rec, axis, angle, resid_deg, pivot)`` where ``R_rec``
+    (T,3,3) and ``t_rec`` (T,3) are the *reconstructed* wrist-frame object pose
+    under the single-axis assumption, and ``pivot`` (3,) is the fitted fixed
+    point on the axis (the perpendicular-part least-squares solution).
     """
     import torch
     from pytorch3d.transforms import axis_angle_to_matrix
@@ -218,7 +219,7 @@ def _fit_fixed_axis_motion(R_wrist_frame, t_wrist_frame):
     resid_deg = torch.rad2deg(torch.acos(cos_d.clamp(-1.0, 1.0)))        # (T,)
 
     return (proc_numpy(R_rec), proc_numpy(t_rec), proc_numpy(axis),
-            proc_numpy(angle), proc_numpy(resid_deg))
+            proc_numpy(angle), proc_numpy(resid_deg), proc_numpy(pivot))
 
 
 def _wrist_origin(x_hand, layer):
@@ -311,7 +312,7 @@ def pose_wrist_aligned_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0)
     R_true = np.einsum('tji,tkj->tik', wrist_R, obj_R)                       # R_w^T R_o^T
     t_true = np.einsum('tji,tj->ti', wrist_R, obj_t - wrist_o)
 
-    R_rec, t_rec, axis, angle, resid_deg = _fit_fixed_axis_motion(R_true, t_true)
+    R_rec, t_rec, axis, angle, resid_deg, _pivot = _fit_fixed_axis_motion(R_true, t_true)
 
     # R_true/R_rec are already the applied wrist-frame rotation → direct multiply.
     obj_true = np.einsum('tij,kj->tki', R_true, verts0) + t_true[:, None]

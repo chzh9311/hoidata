@@ -127,11 +127,16 @@ def compute_face_angles(verts, faces):
     l12 = e12.norm(p=2, dim=-1)
     l23 = e23.norm(p=2, dim=-1)
     l31 = e31.norm(p=2, dim=-1)
-    va1 = torch.sum(e12 * -e31, dim=-1) / (l12 * l31)
-    va2 = torch.sum(e23 * -e12, dim=-1) / (l23 * l12)
-    va3 = torch.sum(e31 * -e23, dim=-1) / (l31 * l23)
+    # eps guards zero-length edges; the clamp guards acos against a cosine that
+    # roundoff pushed just past +-1 on a near-collinear sliver triangle.  GRAB's
+    # camera.ply has two such faces, and without the clamp their NaN angle
+    # scatter-adds into the vertex normals and then into every distance computed
+    # against this mesh.
+    va1 = torch.sum(e12 * -e31, dim=-1) / (l12 * l31).clamp_min(1e-12)
+    va2 = torch.sum(e23 * -e12, dim=-1) / (l23 * l12).clamp_min(1e-12)
+    va3 = torch.sum(e31 * -e23, dim=-1) / (l31 * l23).clamp_min(1e-12)
     face_cosines = torch.cat([va1, va2, va3], dim=2).view(bs, nf, 3)
-    face_angles = face_cosines.acos_()
+    face_angles = face_cosines.clamp_(-1.0, 1.0).acos_()
     if ndim_old == 2:
         face_angles = face_angles.squeeze_(0)
     return face_angles
@@ -213,7 +218,9 @@ def pcd_mesh_distance_approx(verts, faces, verts_query, along_normal=True):
 
     disp = verts_query - nn
     disp_norm = disp.norm(dim=2)  # (N, V2)
-    disp_dir = disp / disp_norm.unsqueeze(-1)  # (N, V2, 3)
+    # A query point sitting exactly on its nearest mesh vertex gives 0/0; the
+    # clamp makes its direction (and hence signed distance) 0 rather than NaN.
+    disp_dir = disp / disp_norm.unsqueeze(-1).clamp_min(1e-12)  # (N, V2, 3)
     cos = (disp_dir * vn_).sum(dim=2)  # (N, V2)
     if along_normal:
         signed_dist = disp_norm * cos

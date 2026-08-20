@@ -63,6 +63,7 @@ from hoidata.utils.proc import (
     transform_hand_to_xdata,
     transform_obj_to_xdata,
     transform_xdata_to_joints,
+    unit_vertex_normals,
 )
 from pytorch3d.transforms import axis_angle_to_matrix
 from hoidata.constants.grab_constants import (
@@ -116,6 +117,10 @@ def preprocessing_object(cfg):
     GRAB objects are rigid ``.ply`` meshes in a flat directory (no per-object
     subdir / articulation parts).  Meshes are already in metres, so — unlike
     ARCTIC (mm → m) — no unit conversion is applied.
+
+    Normals go through ``unit_vertex_normals`` rather than a plain divide by
+    their own length: five of the meshes have vertices whose trimesh normal is
+    exactly zero, which a plain divide turns into NaN (see that function).
     """
     object_paths = sorted(glob.glob(osp.join(cfg.obj_root, "*.ply")))
 
@@ -127,8 +132,9 @@ def preprocessing_object(cfg):
     for object_path in tqdm.tqdm(object_paths, desc="objects"):
         mesh = trimesh.load(object_path, maintain_order=True)
         verts = torch.FloatTensor(mesh.vertices).unsqueeze(0).cuda()
-        normal = torch.FloatTensor(mesh.vertex_normals).unsqueeze(0).cuda()
-        normal = normal / torch.norm(normal, dim=2, keepdim=True)
+        normal = unit_vertex_normals(
+            mesh.vertices, mesh.faces, mesh.vertex_normals)
+        normal = torch.FloatTensor(normal).unsqueeze(0).cuda()
 
         point_set = farthest_point_sample(verts, 1024)
         sampled_pc = verts[0, point_set[0]].cpu().numpy()

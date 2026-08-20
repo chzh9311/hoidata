@@ -23,14 +23,14 @@
             "args": "${command:pickArgs}"
         },
         {
-            "name": "Data loading analysis",
+            "name": "DoF Analysis",
             "type": "debugpy",
             "request": "launch",
             "module": "scripts.dof_analysis",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "justMyCode": false,
-            "args": "${command:pickArgs}"
+            // "args": "${command:pickArgs}"
         },
         {
             // Launch the web viewer in wrist-aligned mode under the debugger.

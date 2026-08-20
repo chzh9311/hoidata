@@ -67,7 +67,11 @@ def capsule_sdf(mesh_verts, mesh_normals, query_points, query_normals, caps_rad,
     bot_to_top = capsule_bots - capsule_tops  # Vector from capsule bottom to top
     along_axis = torch.sum(delta_top * bot_to_top, dim=2)   # Dot product
     top_to_bot_square = torch.sum(bot_to_top * bot_to_top, dim=2)
-    h = torch.clamp(along_axis / top_to_bot_square, 0, 1)   # Could avoid NaNs with offset in division here
+    # bot_to_top is the mesh normal scaled by (caps_bot - caps_top), so a vertex
+    # with a zero-length normal makes top_to_bot_square 0 and the division 0/0.
+    # The eps degenerates that capsule to its top focus (h=0) instead of poisoning
+    # the whole frame's contact map with NaN.
+    h = torch.clamp(along_axis / (top_to_bot_square + 1e-12), 0, 1)
     dist_to_axis = torch.norm(delta_top - bot_to_top * h.unsqueeze(2), dim=2)   # Distance to capsule centerline
 
     return dist_to_axis / caps_rad, normal_dot, nearest_idx  # (Normalized SDF)+1 0 on endpoint, 1 on edge of capsule

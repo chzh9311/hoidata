@@ -269,6 +269,73 @@ def get_which_hands_inter(lcf_idx, rcf_idx):
 # Point cloud helpers
 # ---------------------------------------------------------------------------
 
+def unit_vertex_normals(verts, faces, normals, eps=1e-8):
+    """Unit per-vertex normals, repairing vertices whose normal is degenerate.
+
+    ``trimesh.Trimesh.vertex_normals`` sums the *signed* adjacent face normals, so
+    a vertex surrounded by inconsistently wound faces gets a normal of exactly
+    zero — the contributions cancel.  Five GRAB meshes hit this, worst of all
+    ``camera.ply`` (19 vertices, all on flat regions where a few faces are wound
+    backwards).  Normalising such a vertex by its own zero length yields
+    ``[nan, -inf, nan]``, which lands in ``obj.pkl`` and from there in every
+    posed frame's object normals and contact map.
+
+    Broken vertices are recovered from their 1-ring: the dominant eigenvector of
+    the area-weighted face-normal scatter gives the surface direction (which is
+    well defined — only the *sign* was ambiguous), and the sign is taken from the
+    neighbouring intact vertex normals, falling back to pointing away from the
+    mesh centroid.  Intact vertices are only normalised, never moved.
+
+    Args:
+        verts: (V, 3), faces: (F, 3), normals: (V, 3) — e.g. the ``vertices`` /
+            ``faces`` / ``vertex_normals`` of a ``trimesh.Trimesh``.
+    Returns:
+        (V, 3) float64 unit normals, guaranteed finite.
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    n = np.array(normals, dtype=np.float64)
+
+    length = np.linalg.norm(n, axis=1)
+    good = np.isfinite(n).all(axis=1) & (length > eps)
+    n[good] /= length[good][:, None]
+    n[~good] = 0.0
+
+    broken = np.flatnonzero(~good)
+    if broken.size == 0:
+        return n
+
+    tri = verts[faces]
+    face_cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    face_area = np.linalg.norm(face_cross, axis=1)          # 2x area, weight only
+    ok_face = face_area > eps
+    face_normal = np.zeros_like(face_cross)
+    face_normal[ok_face] = face_cross[ok_face] / face_area[ok_face][:, None]
+
+    centroid = verts.mean(axis=0)
+    for v in broken:
+        outward = verts[v] - centroid
+        adj = np.flatnonzero((faces == v).any(axis=1))
+        adj = adj[ok_face[adj]]
+        if adj.size:
+            fn = face_normal[adj]
+            M = (fn * face_area[adj][:, None]).T @ fn        # (3, 3), symmetric PSD
+            axis = np.linalg.eigh(M)[1][:, -1]               # dominant, sign arbitrary
+            ring = np.setdiff1d(faces[adj].reshape(-1), v)
+            ref = n[ring[good[ring]]].sum(axis=0)
+        else:
+            axis, ref = outward, outward
+        if np.linalg.norm(ref) <= eps:
+            ref = outward
+        if np.dot(axis, ref) < 0:
+            axis = -axis
+        norm = np.linalg.norm(axis)
+        # A vertex with no usable 1-ring *and* sitting on the centroid has no
+        # defined direction at all; any unit vector beats a NaN.
+        n[v] = axis / norm if norm > eps else np.array([0.0, 0.0, 1.0])
+    return n
+
+
 def farthest_point_sample(xyz, npoint):
     """Farthest point sampling on a point cloud.
 

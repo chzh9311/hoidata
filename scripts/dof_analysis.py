@@ -27,8 +27,9 @@ from omegaconf import OmegaConf
 import torch
 
 from hoidata.utils.hand_proc import ManoLayerWrapper
-from pytorch3d.transforms import axis_angle_to_matrix, rotation_6d_to_matrix
-from pytorch3d.transforms.so3 import hat_inv
+from pytorch3d.transforms import rotation_6d_to_matrix, matrix_to_axis_angle
+from hoidata.analysis.joint_rotation import (
+    normalize_joint_rotations, geodesic_angle)
 from hoidata.dataloaders.grab_dataset import (
     StableGraspGRABDataModule, TransitionMotionGRABDataModule)
 from hoidata.dataloaders.arctic_dataset import StableGraspARCTICDataModule
@@ -81,96 +82,144 @@ def describe(name, ds):
           f"obj={it['obj_name']} n_frames={it['n_frames']}")
 
 
-def avg_rotation_axis(Rs):
-    """Dominant rotation axis of a batch of rotation matrices (T, 3, 3).
+# MANO finger → its 3 joint indices within the 15 finger joints (x_hand[:, 9:]).
+# The pose is fed to manopth in its native order (index, middle, pinky, ring,
+# thumb), each finger a proximal→distal chain of 3 joints — confirmed by the
+# kintree parents [0,1,2, 0,4,5, 0,7,8, 0,10,11, 0,13,14].
+FINGER_JOINTS = {
+    "index":  [0, 1, 2],
+    "middle": [3, 4, 5],
+    "pinky":  [6, 7, 8],
+    "ring":   [9, 10, 11],
+    "thumb":  [12, 13, 14],
+}
+FINGERS = list(FINGER_JOINTS)
 
-    The skew part of each R is ``sin(theta) * [u]_x``, so ``vee`` of it gives
-    ``sin(theta) * u`` — a vector along that frame's rotation axis, weighted by
-    how much it rotates.  Stacking those into the scatter matrix
-    ``M = S^T S`` and taking the eigenvector of the largest eigenvalue yields the
-    axis that best explains the whole batch (a least-squares fit, so small-angle
-    frames contribute little and noise averages out).
 
-    Note this is an *axis*, not a full mean rotation: sign is arbitrary (``u``
-    and ``-u`` span the same eigenspace) and the angle is not recovered.  Frames
-    rotating by ~180 deg have ``sin(theta) ~ 0`` and drop out.
+def analyze(datasets, lhand_layer, rhand_layer):
+    """Fixed-axis / fixed-pivot DOF fit per clip, in the transition hand's frame.
 
-    Returns a unit ``(3,)`` tensor.
+    For each clip the object pose is expressed in the wrist frame exactly as the
+    ``--wrist-aligned`` viewer does, then the shared estimator
+    ``_fit_fixed_axis_motion`` fits a single rotation axis and a fixed pivot.
+    Sharing the viewer's origin (``_wrist_origin``) and fit keeps the reported
+    ``resid_angle`` / ``pivot`` in lock-step with what the viewer draws.
+
+    Per-finger R2 (fraction of each finger's mean-relative joint-rotation
+    variance explained by the object's single-DOF harmonic angle) is collected
+    across every clip and the dataset mean AND median are printed at the end.
+    The median is reported alongside the mean because a few near-static clips
+    (a finger that barely moves has total_var ~ 0, so its R2 is ill-defined and
+    can blow up hugely negative) otherwise dominate the plain mean.
     """
-    sinaa = hat_inv((Rs - Rs.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
-    M = sinaa.transpose(0, 1) @ sinaa  # (3, 3), symmetric PSD
-    # eigh returns eigenvalues ascending, so the last column is the dominant axis.
-    _, evecs = torch.linalg.eigh(M)
-    return evecs[:, -1]
+    from hoidata.vis.o3d_visualizer import _wrist_origin, _fit_fixed_axis_motion
 
-
-def analyze(datasets):
-    """Placeholder for the DOF analysis.
-
-    ``datasets`` is a dict {name: dataset}.  Each dataset yields items with
-    ``x_hand`` (T, 99) — trans(3) + rot6d(16*6) — which is the natural input for
-    measuring effective DOFs (e.g. PCA over per-frame hand pose, or per-joint
-    range of motion).
-    """
-    print("\n[analyze] not implemented yet — datasets are loaded and ready.")
     for name, ds in datasets.items():
-        print(f"  {name}: {len(ds)} clips available as ds[i]['x_hand']")
+        print(f"  {name}: {len(ds)} clips")
+        # Collect per-finger R2 over all clips for the dataset mean/median.
+        finger_r2_all = {f: [] for f in FINGERS}
+        # Collect per-clip residual-PCA cumulative EVR (K1,K2,K3) for the average.
+        topk_evr_all = []
         for i, it in enumerate(ds):
-            print(f"    ds[{i}]: x_hand={it['x_hand'].shape} x_object={it['x_object'].shape} "
-                  f"obj={it['obj_name']} n_frames={it['n_frames']}")
-            # Datasets yield numpy; the pytorch3d converters are torch, so
-            # convert at the boundary.
-            x_object = torch.from_numpy(it['x_object']).float()  # (T, 9|10)
-            x_hand = torch.from_numpy(it['x_hand']).float()      # (T, 99)
+            # Transition hand for this clip (stable grasps expose is_lhand/is_rhand;
+            # transitions expose hand_sides — accept either, like the viewer).
+            if "hand_sides" in it:
+                side = it["hand_sides"][0]
+            else:
+                side = "left" if it["is_lhand"] else "right"
+            layer = lhand_layer if side == "left" else rhand_layer
 
-            obj_rot = x_object[:, 3:9]  # (T, 6) rot6d
-            obj_R = rotation_6d_to_matrix(obj_rot)  # (T, 3, 3)
-            obj_t = x_object[:, :3]  # (T, 3) translation
-            wrist_rot = x_hand[:, 3:9]  # (T, 6) rot6d
-            wrist_R = rotation_6d_to_matrix(wrist_rot)  # (T, 3, 3)
-            wrist_t = x_hand[:, :3]  # (T, 3) translation
-            obj2wrist_R = wrist_R.transpose(1, 2) @ obj_R  # (T, 3, 3)
-            sinaa = hat_inv((obj2wrist_R - obj2wrist_R.transpose(1, 2)) / 2)  # (T, 3) = sin(theta) * u
-            M = sinaa.transpose(0, 1) @ sinaa  # (3, 3), symmetric PSD
-            # eigh returns eigenvalues ascending, so the last column is the dominant axis.
-            _, evecs = torch.linalg.eigh(M)
-            axis = evecs[:, -1]  # (3,) dominant rotation axis
-            # Per-frame signed angle about `axis`.  cos from the trace, sin from
-            # projecting sin(theta)*u onto the axis; atan2 of the two resolves
-            # the full +-180 deg range (arccos/arcsin alone would fold it).
-            cos_a = (torch.diagonal(obj2wrist_R, dim1=1, dim2=2).sum(-1) - 1) / 2  # (T,)
-            sin_a = sinaa @ axis  # (T,)
-            angle = torch.atan2(sin_a, cos_a)  # (T,) signed, sign tied to `axis`
-            recovered_aa = angle.unsqueeze(-1) * axis  # (T, 3) axis-angle per frame
-            recovered_R = axis_angle_to_matrix(recovered_aa)  # (T, 3, 3) rotation matrix of the average rotation
-            delta_R = obj2wrist_R.transpose(1, 2) @ recovered_R  # (T, 3, 3) difference from average rotation
-            # Per-frame residual angle; clamp guards acos against |cos|>1 from roundoff.
-            cos_d = (torch.diagonal(delta_R, dim1=1, dim2=2).sum(-1) - 1) / 2  # (T,)
-            delta_aa = torch.acos(cos_d.clamp(-1.0, 1.0))  # (T,) angle of the difference rotation
+            x_object = it["x_object"]                              # (T, 9|10) numpy
+            x_hand = it["x_hand"]                                  # (T, 99)   numpy
+            xo = torch.from_numpy(np.asarray(x_object, np.float32))
+            xh = torch.from_numpy(np.asarray(x_hand, np.float32))
 
-            # Constant pivot t, assuming the clip is a rotation about a fixed point:
-            #   x -> R_i (x - t) + t = R_i x + (I - R_i) t.
-            # The observed relative translation is the object origin in the wrist
-            # frame, so each frame contributes 3 equations (I - R_i) t = d_i.
-            obj2wrist_t = torch.einsum(
-                'tij,tj->ti', wrist_R.transpose(1, 2), obj_t - wrist_t)  # (T, 3)
-            I = torch.eye(3, dtype=obj2wrist_R.dtype).expand_as(obj2wrist_R)  # (T, 3, 3)
-            A = (I - recovered_R).reshape(-1, 3)  # (3T, 3)
-            # The system is homogeneous in t (the constant is implied by the
-            # model), so obj2wrist_t must NOT be mean-centred -- centring removes
-            # the signal the pivot is fitted from and biases the solution.
-            b = obj2wrist_t.reshape(-1)  # (3T,)
-            # (I - R) is singular along `axis` for every frame, so A is rank <= 2: the
-            # component of t along the axis is unobservable (sliding the pivot along
-            # the axis leaves the transform unchanged).  gelsd handles the rank
-            # deficiency and returns the minimum-norm solution, pinning that free
-            # component to 0 -- so t is a point *on* the axis, not a unique 3-D pivot.
-            pivot = torch.linalg.lstsq(A, b, driver='gelsd').solution  # (3,)
-            resid = (A @ pivot - b).reshape(-1, 3).norm(dim=-1)  # (T,) per-frame fit error
+            # Wrist frame: R_w from x_hand rot6d, origin from the POSED wrist joint
+            # (not x_hand[:, :3], MANO's global offset — see _wrist_origin).
+            wrist_R = rotation_6d_to_matrix(xh[:, 3:9])           # (T,3,3) R_w
+            wrist_o = torch.from_numpy(_wrist_origin(x_hand, layer))  # (T,3)
 
-            print(f"      resid_angle={(delta_aa * 180 / torch.pi).mean():.2f}deg "
-                  f"pivot={pivot.numpy().round(4)} "
-                  f"pivot_resid={resid.mean():.4f}m")
+            # GRAB stores R_o un-inverted, but the rotation *applied* to the mesh
+            # is R_o^T -- see the grab branch of process_obj_result (einsum
+            # "btij,bki->btkj" == verts @ R_o == applies R_o^T).  Object pose in
+            # the wrist frame:  R_true = R_w^T R_o^T,  t_true = R_w^T (t_o - o_w).
+            obj_R = rotation_6d_to_matrix(xo[:, 3:9])             # R_o (stored)
+            obj_t = xo[:, :3]                                     # (T,3)
+            R_true = torch.einsum('tji,tkj->tik', wrist_R, obj_R)          # R_w^T R_o^T
+            t_true = torch.einsum('tji,tj->ti', wrist_R, obj_t - wrist_o)  # (T,3)
+
+            _R_rec, _t_rec, _axis, _angle, resid_deg, pivot = \
+                _fit_fixed_axis_motion(R_true.numpy(), t_true.numpy())
+
+            # Joint-rotation normalization: per finger joint, factor out the
+            # Karcher-mean pose and keep the mean-relative rotations.  The per-
+            # joint range of motion is the max geodesic angle of those relatives.
+            hand_pose = xh[:, 9:]                     # (T, 90) = 15 joints rot6d
+            _mean_R, rel_R = normalize_joint_rotations(hand_pose)
+            rel_y = matrix_to_axis_angle(rel_R).view(-1, 45)
+            # rom_deg = torch.rad2deg(geodesic_angle(rel_R)).amax(dim=0)  # (J,)
+
+            harmonic_mat = torch.ones(_t_rec.shape[0], 3)
+            harmonic_mat[:, 1] = torch.cos(torch.from_numpy(_angle))
+            harmonic_mat[:, 2] = torch.sin(torch.from_numpy(_angle))
+            # harmonic_mat[:, 3] = torch.cos(2 * torch.from_numpy(_angle))
+            # harmonic_mat[:, 4] = torch.sin(2 * torch.from_numpy(_angle))
+
+            C = torch.linalg.solve(harmonic_mat.transpose(-1, -2) @ harmonic_mat, harmonic_mat.transpose(-1, -2) @ rel_y)
+            predicted_y = harmonic_mat @ C
+            residual = predicted_y - rel_y                       # (T, 45)
+            residual_var = (residual ** 2).mean(dim=0)
+            total_var = torch.var(rel_y, dim=0)
+            R2 = 1 - residual_var / (total_var + 1e-6)          # (45,) per axis-angle dim
+
+            # PCA on the harmonic-fit residual: how much joint-rotation variation
+            # is left *after* the single object DOF is regressed out (its
+            # principal directions are the candidate extra DOFs).  Covariance
+            # over the T frames of the 45-D residual; eigenvalues = variance
+            # along the residual modes.  The residual is already zero-mean per
+            # dim (LSQ residual is orthogonal to harmonic_mat's constant column),
+            # but center explicitly to be safe.
+            res_c = residual - residual.mean(dim=0, keepdim=True)
+            cov = res_c.transpose(0, 1) @ res_c / max(res_c.shape[0] - 1, 1)  # (45,45)
+            pca_eigvals = torch.linalg.eigvalsh(cov).flip(0)    # (45,) descending
+            # Fraction of residual variance captured by the top-K components
+            # (cumulative explained-variance ratio), K = 1, 2, 3.
+            evr = pca_eigvals / pca_eigvals.sum().clamp_min(1e-12)
+            topk_evr = torch.cumsum(evr, dim=0)[:3]             # [top1, top2, top3]
+            topk_evr_all.append(topk_evr.tolist())
+
+            # Per-finger R2: average over that finger's 3 joints x 3 axis-angle
+            # dims (rel_y is laid out (T, 15*3) joint-major, so joint j -> 3j:3j+3).
+            R2j = R2.view(15, 3)                                # (15 joints, 3 dims)
+            finger_r2 = {f: R2j[FINGER_JOINTS[f]].mean().item() for f in FINGERS}
+            for f in FINGERS:
+                finger_r2_all[f].append(finger_r2[f])
+
+            fingers_str = " ".join(f"{f[:3]}={finger_r2[f]:.3f}" for f in FINGERS)
+            evr_str = ", ".join(f"K{k+1}={v:.2%}" for k, v in enumerate(topk_evr.tolist()))
+            print(f"    ds[{i}]: {side:5s} obj={it['obj_name']:12s} "
+                  f"n_frames={it['n_frames']:3d} | "
+                  f"resid_angle={resid_deg.mean():.2f}deg "
+                  f"pivot={pivot.round(4)} | R2 {fingers_str} | "
+                  f"resid PCA cum-var [{evr_str}]")
+
+        # Dataset per-finger R2: mean AND median (median is robust to the few
+        # near-static clips whose R2 blows up; see the docstring).
+        n_clips = len(next(iter(finger_r2_all.values())))
+        if n_clips:
+            mean_str = "  ".join(
+                f"{f}={np.mean(finger_r2_all[f]):.3f}" for f in FINGERS)
+            med_str = "  ".join(
+                f"{f}={np.median(finger_r2_all[f]):.3f}" for f in FINGERS)
+            print(f"  [{name}] per-finger R2 over {n_clips} clips:")
+            print(f"    mean:    {mean_str}")
+            print(f"    median:  {med_str}")
+
+        # Dataset-average residual-PCA cumulative EVR for K = 1, 2, 3.
+        if topk_evr_all:
+            k1, k2, k3 = np.mean(topk_evr_all, axis=0)
+            print(f"  [{name}] avg residual-PCA cum-var over {len(topk_evr_all)} "
+                  f"clips:  K1={k1:.2%}  K2={k2:.2%}  K3={k3:.2%}")
 
 
 def main():
@@ -209,7 +258,7 @@ def main():
             counts = {t: types.count(t) for t in sorted(set(types))}
             print(f"  types:  {counts}")
 
-    analyze(datasets)
+    analyze(datasets, lhand_layer, rhand_layer)
 
 
 if __name__ == "__main__":

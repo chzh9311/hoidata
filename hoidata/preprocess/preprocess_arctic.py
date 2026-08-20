@@ -56,6 +56,7 @@ from hoidata.utils.proc import (
     transform_hand_to_xdata,
     transform_obj_to_xdata,
     transform_xdata_to_joints,
+    unit_vertex_normals,
 )
 from hoidata.utils.proc_arctic import (
     get_contact_info_arctic,
@@ -184,7 +185,12 @@ def load_stable_grasps(csv_path):
 
 
 def preprocessing_object(cfg):
-    """Sample each object mesh to a 1024-point cloud and save as obj.pkl."""
+    """Sample each object mesh to a 1024-point cloud and save as obj.pkl.
+
+    Normals go through ``unit_vertex_normals`` so a vertex whose trimesh normal
+    is degenerate cannot become NaN — no current ARCTIC mesh trips this, but the
+    GRAB meshes do and the two paths should not drift apart.
+    """
     obj_pcs = {}
     obj_pc_normals = {}
     obj_pc_top = {}
@@ -200,8 +206,9 @@ def preprocessing_object(cfg):
 
         mesh = trimesh.load(object_path, maintain_order=True)
         verts = torch.FloatTensor(mesh.vertices).unsqueeze(0).cuda()
-        normal = torch.FloatTensor(mesh.vertex_normals).unsqueeze(0).cuda()
-        normal = normal / torch.norm(normal, dim=2, keepdim=True)
+        normal = unit_vertex_normals(
+            mesh.vertices, mesh.faces, mesh.vertex_normals)
+        normal = torch.FloatTensor(normal).unsqueeze(0).cuda()
 
         point_set = farthest_point_sample(verts, 1024)
         sampled_pc = verts[0, point_set[0]].cpu().numpy() / 1000   # mm → m
