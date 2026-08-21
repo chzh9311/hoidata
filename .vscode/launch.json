@@ -73,6 +73,25 @@
             ]
         },
         {
+            // Launch the web viewer on the bimanual stable-grasp dataset in the
+            // WORLD frame (no wrist alignment, no 1-DOF fit).  Breakpoints:
+            // grab_dataset.py -> StableGraspMotionDataset._build_bimanual_stable_grasps
+            // and o3d_visualizer.py -> pose_bimanual_stable_grasp_sample.
+            "name": "Debug bimanual stable-grasp viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": [
+                "--config", "configs/grab.yaml",
+                "--split", "test",
+                "--stable-grasp"
+            ]
+        },
+        {
             // Same viewer, but let you type extra args at launch (e.g. a
             // different --split / --port) via the arg picker.
             "name": "Debug wrist-aligned viewer (pick args)",

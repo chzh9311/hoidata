@@ -17,7 +17,7 @@ from omegaconf import OmegaConf
 from hoidata.dataloaders.action_dataset import ObjectModel
 from hoidata.dataloaders.grab_dataset import (
     MotionGRAB, TransitionMotionGRAB, BimanualTransitionMotionGRAB,
-    StableGraspGRAB)
+    StableGraspGRAB, BimanualStableGraspGRAB)
 from hoidata.dataloaders.arctic_dataset import MotionARCTIC, StableGraspARCTIC
 from hoidata.utils.hand_proc import ManoLayerWrapper
 from hoidata.utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
@@ -578,6 +578,105 @@ def pose_bimanual_transition_sample(
         "obj_name": item["obj_name"],
         # Label carries object / driving hand(s) / transition-type.
         "action_name": ds.transition_label(index),
+        "labels": [],
+        "subject": "",
+        "grasps": {"left": [], "right": []},
+    }
+
+
+def build_bimanual_stable_grasp_dataset(cfg, split: str = "test"):
+    """Build the MANO layers and a :class:`BimanualStableGraspGRAB` dataset.
+
+    Mirrors :func:`build_stable_grasp_dataset` but constructs the *bimanual*
+    stable-grasp dataset (one item per constant-grasp-count segment, both hands'
+    grasps merged).  GRAB only.  ``min_len`` comes from the config
+    (``stable_grasp_min_len``, else ``transition_min_len``, else 10).
+    Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.flat_hand, mano_root=cfg.mano_root,
+        use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+
+    min_len = cfg.get("stable_grasp_min_len", cfg.get("transition_min_len", 10))
+    ds = BimanualStableGraspGRAB(
+        data_path=cfg.data_path,
+        data_obj_pc_path=cfg.data_obj_pc_path,
+        text_json=cfg.text_json,
+        max_nframes=-1,
+        task="evaluate",
+        split=split,
+        lhand_layer=lhand_layer,
+        rhand_layer=rhand_layer,
+        stable_grasp_csv=cfg.get("stable_grasp_csv"),
+        min_len=min_len,
+    )
+    return ds, lhand_layer, rhand_layer
+
+
+def pose_bimanual_stable_grasp_sample(
+        cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Pose one bimanual stable-grasp segment from :class:`BimanualStableGraspGRAB`.
+
+    Everything is drawn in the **world frame** (no wrist alignment): each active
+    hand's raw ``x_lhand`` / ``x_rhand`` window is posed to world-space MANO
+    vertices and the object is posed from the item's ``x_object`` window.  No
+    fixed-axis / 1-DOF fit is done — this simply shows the true motion.  The
+    per-hand vertex blocks are concatenated into ``(Tt, 778*H, 3)`` for the
+    viewer's ``build_hand_mesh``.
+    """
+    from hoidata.utils.proc import transform_xdata_to_verts
+
+    item = ds[index]
+    # Which hands are grasping in this segment (bimanual "both" has both).
+    sides = []
+    if item["is_lhand"]:
+        sides.append("left")
+    if item["is_rhand"]:
+        sides.append("right")
+
+    hand_blocks = []
+    for side in sides:
+        layer = lhand_layer if side == "left" else rhand_layer
+        xh = np.asarray(item["x_lhand" if side == "left" else "x_rhand"],
+                        dtype=np.float32)                                  # (Tt, D)
+        verts = transform_xdata_to_verts(xh, layer).astype(np.float32)     # (Tt,778,3)
+        hand_blocks.append(verts)
+    hand_verts = np.concatenate(hand_blocks, axis=1)  # (Tt, 778*H, 3)
+
+    # Object: rigid GRAB mesh posed per frame from the item's x_object window.
+    _, _, _, obj_path = ObjectModel(cfg.data_obj_pc_path)(item["obj_name"])
+    mesh = trimesh.load(osp.join(cfg.obj_root, obj_path), process=False)
+    obj_verts_t = process_obj_result(
+        proc_torch_cuda(np.asarray(mesh.vertices, dtype=np.float32)),
+        proc_torch_cuda(item["x_object"]),
+        "grab",
+    )
+    obj_verts = proc_numpy(obj_verts_t)
+    obj_faces = np.asarray(mesh.faces)
+
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    label = (f"{item['obj_name']} {item['hand_side']} grasp #{index}"
+             + (f" | {item['text']}" if item.get("text") else ""))
+    return {
+        "hand_verts": hand_verts,
+        "hand_faces": hand_faces,
+        "hand_sides": sides,
+        "obj_verts": obj_verts,
+        "obj_faces": obj_faces,
+        "nframes": item["n_frames"],
+        "obj_name": item["obj_name"],
+        "action_name": label,
         "labels": [],
         "subject": "",
         "grasps": {"left": [], "right": []},

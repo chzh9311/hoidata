@@ -36,7 +36,8 @@ from omegaconf import OmegaConf
 from hoidata.vis.o3d_visualizer import (
     build_dataset, pose_sample, build_transition_dataset, pose_transition_sample,
     build_bimanual_transition_dataset, pose_bimanual_transition_sample,
-    build_stable_grasp_dataset, pose_wrist_aligned_sample)
+    build_stable_grasp_dataset, pose_wrist_aligned_sample,
+    build_bimanual_stable_grasp_dataset, pose_bimanual_stable_grasp_sample)
 from hoidata.preprocess.preprocess_arctic import parse_description_labels
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
@@ -65,6 +66,7 @@ STATE = {
     "transition": False,  # True → GRAB transition-motion dataset
     "bimanual": False,   # True → GRAB bimanual (merged-hand) transition dataset
     "wrist_aligned": False,  # True → wrist-frame original vs. reconstructed object
+    "stable_grasp": False,   # True → world-frame bimanual stable-grasp segments
     "label_mode": False,     # True → action-label editing enabled (ARCTIC only)
     "label_dir": None,        # working-copy dir for editable description.txt files
     "seq_meta": [],           # index -> {subject, action_name, nframes} (label mode)
@@ -161,7 +163,8 @@ def _write_description(path, labels):
             f.write("\n")
 
 
-def _build_sequence_list(ds, transition=False, wrist_aligned=False):
+def _build_sequence_list(ds, transition=False, wrist_aligned=False,
+                         stable_grasp=False):
     """Cheap per-index metadata for the dropdown — no MANO/GPU posing.
 
     Uses the ``_object_name`` hook (uniform across GRAB/ARCTIC) rather than a
@@ -170,19 +173,30 @@ def _build_sequence_list(ds, transition=False, wrist_aligned=False):
 
     For the transition dataset each index is a *transition* (not a sequence), so
     per-transition helpers (``transition_label`` / ``transition_nframes``) supply
-    the label and length.  For the wrist-aligned view each index is a *stable
-    grasp* (one CSV row): the length comes from the flat per-grasp index arrays.
+    the label and length.  For the wrist-aligned and bimanual stable-grasp views
+    each index is a flat per-grasp/per-segment row: the label carries the grasp
+    ``hand_side`` and the length comes from its start/end frames.
     """
     seqs = []
     for i in range(len(ds)):
-        if wrist_aligned:
+        if wrist_aligned or stable_grasp:
             sg = ds.stable_grasps
             side = sg["hand_side"][i]
             nframes = int(sg["end_frame"][i]) - int(sg["start_frame"][i])
+            label = f"{ds._object_name(i)} {side} grasp #{i}"
+            # Append the natural-language description (bimanual stable-grasp
+            # view).  _build_sequence_list runs at startup with no posing, but
+            # _sg_text is cheap (no GPU) — call it directly off the flat index so
+            # the dropdown carries the same text the viewport shows.
+            if stable_grasp and hasattr(ds, "_sg_text"):
+                text = ds._sg_text(int(sg["seq_idx"][i]),
+                                   bool(sg["is_lhand"][i]), bool(sg["is_rhand"][i]))
+                if text:
+                    label = f"{label} | {text}"
             seqs.append({
                 "index": i,
                 "obj_name": str(ds._object_name(i)),
-                "action_name": f"{ds._object_name(i)} {side} grasp #{i}",
+                "action_name": label,
                 "nframes": nframes,
             })
         elif transition:
@@ -299,7 +313,12 @@ def _get_sequence_payload(index):
     """Return (meta, blob) for a sequence, posing + caching on first request."""
     if index in STATE["cache"]:
         return STATE["cache"][index]
-    if STATE["wrist_aligned"]:
+    if STATE["stable_grasp"]:
+        sample = pose_bimanual_stable_grasp_sample(
+            STATE["cfg"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    elif STATE["wrist_aligned"]:
         sample = pose_wrist_aligned_sample(
             STATE["cfg"], STATE["ds"],
             STATE["lhand_layer"], STATE["rhand_layer"], index,
@@ -428,6 +447,11 @@ def main():
                              "fixed at the origin, with the true object motion and "
                              "the fixed-axis reconstruction overlaid in the same "
                              "space (one item per stable grasp).")
+    parser.add_argument("--stable-grasp", action="store_true",
+                        help="View GRAB bimanual stable-grasp segments "
+                             "(BimanualStableGraspGRAB) in the WORLD frame: hands "
+                             "and object shown as-is per segment, no wrist "
+                             "alignment and no 1-DOF fit. GRAB config only.")
     parser.add_argument("--label", action="store_true",
                         help="Enable action-label editing (ARCTIC full_motion only). "
                              "Edits persist to data/{dataset}_description/ and sync "
@@ -437,17 +461,27 @@ def main():
     cfg = OmegaConf.load(args.config)
     dataset_name = cfg.name
 
-    if args.transition and args.bimanual:
-        parser.error("--transition and --bimanual are mutually exclusive.")
+    view_modes = [args.transition, args.bimanual, args.wrist_aligned,
+                  args.stable_grasp]
+    if sum(bool(m) for m in view_modes) > 1:
+        parser.error("--transition / --bimanual / --wrist-aligned / --stable-grasp "
+                     "are mutually exclusive.")
 
     if args.label:
         if dataset_name != "arctic" or not cfg.get("full_motion", False):
             parser.error("--label is only supported for the ARCTIC full_motion config.")
-        if args.transition or args.bimanual or args.wrist_aligned:
-            parser.error("--label cannot be combined with "
-                         "--transition / --bimanual / --wrist-aligned.")
+        if any(view_modes):
+            parser.error("--label cannot be combined with --transition / "
+                         "--bimanual / --wrist-aligned / --stable-grasp.")
 
-    if args.wrist_aligned:
+    if args.stable_grasp:
+        if dataset_name != "grab":
+            parser.error("--stable-grasp is only supported for the GRAB config.")
+        print(f"Building GRAB bimanual stable-grasp dataset (split={args.split}) "
+              f"for the world-frame view ...")
+        ds, lhand_layer, rhand_layer = build_bimanual_stable_grasp_dataset(
+            cfg, args.split)
+    elif args.wrist_aligned:
         print(f"Building stable-grasp dataset ({dataset_name}, "
               f"split={args.split}) for the wrist-aligned view ...")
         ds, lhand_layer, rhand_layer = build_stable_grasp_dataset(
@@ -473,7 +507,7 @@ def main():
         ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
     sequences = _build_sequence_list(
         ds, transition=args.transition or args.bimanual,
-        wrist_aligned=args.wrist_aligned)
+        wrist_aligned=args.wrist_aligned, stable_grasp=args.stable_grasp)
 
     label_dir = _ensure_label_dir(cfg, dataset_name) if args.label else None
     seq_meta = _build_seq_meta(ds) if args.label else []
@@ -491,12 +525,14 @@ def main():
         "transition": args.transition,
         "bimanual": args.bimanual,
         "wrist_aligned": args.wrist_aligned,
+        "stable_grasp": args.stable_grasp,
         "label_mode": args.label,
         "label_dir": label_dir,
         "seq_meta": seq_meta,
     })
 
-    kind = ("stable grasps" if args.wrist_aligned
+    kind = ("bimanual stable grasps" if args.stable_grasp
+            else "stable grasps" if args.wrist_aligned
             else "bimanual transitions" if args.bimanual
             else "transitions" if args.transition else "sequences")
     print(f"Loaded {len(sequences)} {kind}. Serving at "

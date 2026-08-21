@@ -930,6 +930,27 @@ class StableGraspGRAB(StableGraspMotionDataset):
     def _sg_obj_name(self, seq_idx):
         return str(self.obj_name[seq_idx])
 
+    def _sg_text(self, seq_idx, is_lhand, is_rhand):
+        """Description for the grasping hand, built like ``MotionGRAB._text``.
+
+        Uses the sequence's ``action_name`` and processed object name with the
+        stable-grasp hand's flags (``is_lhand`` / ``is_rhand``).  Returns the
+        **first** description for that action/object/hand key — deterministic, so
+        the dropdown and the viewport show the same sentence (``process_text``
+        samples randomly, which would make the two disagree).  Returns ``None``
+        when no descriptions are loaded (e.g. the ``action_classify`` task) or the
+        combination has no entry in the description JSON.
+        """
+        if self.text_description is None:
+            return None
+        key = process_text(
+            self.action_name[seq_idx], self.proc_obj_name[seq_idx],
+            is_lhand, is_rhand, self.text_description, return_key=True)
+        entries = self.text_description.get(key)
+        if not entries:
+            return None
+        return str(entries[0])
+
 
 class StableGraspGRABDataModule(MotionGRABDataModule):
     """LightningDataModule wrapping :class:`StableGraspGRAB`.
@@ -956,3 +977,52 @@ class StableGraspGRABDataModule(MotionGRABDataModule):
             stable_grasp_csv=dc.get("stable_grasp_csv"),
         )
 
+
+class BimanualStableGraspGRAB(StableGraspGRAB):
+    """GRAB *bimanual* stable-grasp clips — merged left+right grasp timeline.
+
+    Unlike :class:`StableGraspGRAB` (one clip per raw CSV grasp row), this treats
+    both hands' grasps as one timeline: every left/right grasp start/end is a
+    transition point, and one clip is emitted per constant-grasp-count segment
+    between consecutive transition points where **at least one hand** is in stable
+    grasp (count >= 1) and the segment is at least ``min_len`` frames long.  A
+    count-2 segment is tagged ``hand_side="both"``; a count-1 segment names the
+    single grasping hand.  See ``StableGraspMotionDataset._build_bimanual_stable_grasps``.
+
+    Items expose ``x_lhand`` / ``x_rhand`` (each the active hand's window or None)
+    plus ``x_hand`` (the single hand's window for a one-hand clip, else None), the
+    object window, and a ``text`` description built for the grasping hand(s).
+    """
+
+    def __init__(self, *args, min_len=0, **kwargs):
+        super().__init__(*args, bimanual=True, min_len=min_len, **kwargs)
+
+
+class BimanualStableGraspGRABDataModule(MotionGRABDataModule):
+    """LightningDataModule wrapping :class:`BimanualStableGraspGRAB`.
+
+    Same preprocessing / split machinery and CSV path as
+    :class:`StableGraspGRABDataModule`; the minimum bimanual-segment length comes
+    from ``cfg.stable_grasp_min_len`` (defaults to ``transition_min_len``, else 10).
+    """
+
+    dataset_cls = BimanualStableGraspGRAB
+
+    def _make_dataset(self, split: str):
+        dc = self.cfg
+        min_len = dc.get("stable_grasp_min_len",
+                         dc.get("transition_min_len", 10))
+        return self.dataset_cls(
+            data_path=dc.data_path,
+            data_obj_pc_path=dc.data_obj_pc_path,
+            text_json=dc.text_json,
+            max_nframes=-1,          # per-segment clips; no windowing
+            data_ratio=dc.get("data_ratio", 1.0),
+            task=self.task,
+            split=split,
+            lhand_layer=self.lhand_layer,
+            rhand_layer=self.rhand_layer,
+            subject_layers=self.subject_layers,
+            stable_grasp_csv=dc.get("stable_grasp_csv"),
+            min_len=min_len,
+        )

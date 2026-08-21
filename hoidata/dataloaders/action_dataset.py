@@ -734,10 +734,17 @@ class StableGraspMotionDataset(MotionDatasetBase):
       - ``_sg_x_object(seq_idx, a, b)`` : object x-data window.
     """
 
-    def __init__(self, *args, stable_grasp_csv=None, **kwargs):
+    def __init__(self, *args, stable_grasp_csv=None, bimanual=False, min_len=0,
+                 **kwargs):
         # Stored before super().__init__(): _load_data (which reads the CSV and
         # builds the per-grasp index) runs *inside* the base __init__.
         self.stable_grasp_csv = stable_grasp_csv
+        # Bimanual mode: emit one clip per constant-grasp-count segment (>=1 hand
+        # grasping) between consecutive left/right grasp transition points, rather
+        # than one clip per raw CSV grasp row.  ``min_len`` drops segments shorter
+        # than this (in frames); 0 keeps every non-empty segment.
+        self.bimanual = bimanual
+        self.min_len = int(min_len)
         super().__init__(*args, **kwargs)
 
     # --------------------------------------------------------- subclass hooks
@@ -757,6 +764,15 @@ class StableGraspMotionDataset(MotionDatasetBase):
         """Object x-data window ``[a, b)`` for sequence ``seq_idx``."""
         return np.asarray(self.x_obj[seq_idx][a:b], dtype=np.float32)
 
+    def _sg_text(self, seq_idx, is_lhand, is_rhand):
+        """Natural-language description for a grasp, or ``None``.
+
+        ``is_lhand`` / ``is_rhand`` are the **grasping** hand's flags (exactly one
+        is True for a stable grasp).  The default returns ``None``; subclasses
+        override to build a prompt (e.g. via ``process_text``).
+        """
+        return None
+
     # ------------------------------------------------------------- data load
     def _load_data(self, data, task, split):
         mask = self._sg_split_mask(data, split)
@@ -767,12 +783,17 @@ class StableGraspMotionDataset(MotionDatasetBase):
         self.lcf_idx = self.lcov_idx = self.lchj_idx = self.ldist_value = None
         self.rcf_idx = self.rcov_idx = self.rchj_idx = self.rdist_value = None
 
-        # Flat per-grasp index: one entry per CSV row that lands in this split.
+        # Flat per-grasp index: one entry per clip that lands in this split.
+        # ``hand_side`` is "left"/"right" (single-hand grasp) or "both" (bimanual
+        # count-2 segment); ``is_lhand``/``is_rhand`` flag which hands are active.
         self.stable_grasps = {
             "seq_idx": [], "start_frame": [], "end_frame": [],
-            "hand_side": [], "obj_name": [],
+            "hand_side": [], "obj_name": [], "is_lhand": [], "is_rhand": [],
         }
-        self._build_stable_grasps()
+        if self.bimanual:
+            self._build_bimanual_stable_grasps()
+        else:
+            self._build_stable_grasps()
 
     def _build_stable_grasps(self):
         """Read the stable-grasp CSV and flatten its rows into a per-grasp index."""
@@ -803,28 +824,126 @@ class StableGraspMotionDataset(MotionDatasetBase):
                     sg["end_frame"].append(e)
                     sg["hand_side"].append(side)
                     sg["obj_name"].append(obj_name)
+                    sg["is_lhand"].append(side == "left")
+                    sg["is_rhand"].append(side == "right")
+
+    def _build_bimanual_stable_grasps(self):
+        """Flatten the CSV into per-segment bimanual stable-grasp clips.
+
+        A *bimanual stable grasp* considers both hands' grasp intervals together.
+        Every left/right grasp start/end is a **transition point**; between two
+        consecutive transition points the set of grasping hands is constant, so
+        each such segment has a fixed grasp count (0, 1 or 2).  One clip is
+        emitted per segment where **at least one hand** is in stable grasp
+        (count >= 1) and the segment is at least ``min_len`` frames long.  A
+        count-2 segment is tagged ``hand_side="both"``; a count-1 segment carries
+        the single grasping hand.
+
+        Touching / overlapping same-hand intervals are coalesced first so an
+        abutting boundary (``[a,m)+[m,b)``) does not create a spurious zero-width
+        release+regrasp transition point.
+        """
+        from hoidata.preprocess.preprocess_arctic import load_stable_grasps
+
+        if not self.stable_grasp_csv:
+            raise ValueError(
+                f"{type(self).__name__} requires `stable_grasp_csv` "
+                "(path to the stable-grasp CSV).")
+
+        grasps = load_stable_grasps(self.stable_grasp_csv)
+
+        def coalesce(segs, N):
+            iv = sorted((max(0, min(int(s), N)), max(0, min(int(e), N)))
+                        for s, e in segs)
+            iv = [(s, e) for s, e in iv if e > s]
+            out = []
+            for s, e in iv:
+                if out and s <= out[-1][1]:
+                    out[-1] = (out[-1][0], max(out[-1][1], e))
+                else:
+                    out.append((s, e))
+            return out
+
+        sg = self.stable_grasps
+        for seq_idx in range(len(self.nframes)):
+            key = self._sg_seq_key(seq_idx)
+            if key not in grasps:
+                continue
+            N = int(self.nframes[seq_idx])
+            obj_name = self._sg_obj_name(seq_idx)
+            left = coalesce(grasps[key]["left"], N)
+            right = coalesce(grasps[key]["right"], N)
+            if not left and not right:
+                continue
+
+            # Transition points: every grasp start/end of either hand, sorted &
+            # deduped.  Segments live between consecutive points.
+            points = sorted({p for s, e in left + right for p in (s, e)})
+
+            for a, b in zip(points[:-1], points[1:]):
+                if b - a < self.min_len:
+                    continue
+                mid = (a + b) / 2.0  # any interior frame: coverage is constant here
+                is_l = any(s <= mid < e for s, e in left)
+                is_r = any(s <= mid < e for s, e in right)
+                count = int(is_l) + int(is_r)
+                if count < 1:            # keep only segments with >=1 hand grasping
+                    continue
+                side = "both" if count == 2 else ("left" if is_l else "right")
+                sg["seq_idx"].append(seq_idx)
+                sg["start_frame"].append(a)
+                sg["end_frame"].append(b)
+                sg["hand_side"].append(side)
+                sg["obj_name"].append(obj_name)
+                sg["is_lhand"].append(is_l)
+                sg["is_rhand"].append(is_r)
 
     # ------------------------------------------------------------------ mechanics
     def __len__(self):
         return len(self.stable_grasps["seq_idx"])
 
     def __getitem__(self, index):
-        """Return one stable-grasp clip (raw hand + object x-data)."""
+        """Return one stable-grasp clip (raw hand(s) + object x-data).
+
+        Unimanual rows have a single grasping hand: ``x_hand`` is that hand's
+        window.  Bimanual "both" rows have two: ``x_hand`` is None and each hand
+        is exposed separately.  ``x_lhand`` / ``x_rhand`` always carry the active
+        hand's window (or None if that hand is not grasping in this clip).
+        """
         sg = self.stable_grasps
         seq_idx = sg["seq_idx"][index]
         a = sg["start_frame"][index]
         b = sg["end_frame"][index]
-        side = sg["hand_side"][index]
+        is_lhand = bool(sg["is_lhand"][index])
+        is_rhand = bool(sg["is_rhand"][index])
 
-        x_hand = (self.x_lhand if side == "left" else self.x_rhand)[seq_idx][a:b]
-        return {
-            "x_hand":   np.asarray(x_hand, dtype=np.float32),   # (T, 99)
+        x_lhand = (np.asarray(self.x_lhand[seq_idx][a:b], dtype=np.float32)
+                   if is_lhand else None)
+        x_rhand = (np.asarray(self.x_rhand[seq_idx][a:b], dtype=np.float32)
+                   if is_rhand else None)
+        # x_hand: the single grasping hand's window for a one-hand clip (backward
+        # compatible); None when both hands grasp (use x_lhand / x_rhand).
+        x_hand = x_lhand if (is_lhand and not is_rhand) else (
+            x_rhand if (is_rhand and not is_lhand) else None)
+
+        item = {
+            "x_hand":   x_hand,                                 # (T, 99) or None
+            "x_lhand":  x_lhand,                                # (T, 99) or None
+            "x_rhand":  x_rhand,                                # (T, 99) or None
             "x_object": self._sg_x_object(seq_idx, a, b),       # (T, 9|10)
-            "is_lhand": side == "left",
-            "is_rhand": side == "right",
+            "hand_side": str(sg["hand_side"][index]),           # left|right|both
+            "is_lhand": is_lhand,
+            "is_rhand": is_rhand,
             "obj_name": str(sg["obj_name"][index]),
             "n_frames": b - a,
         }
+        # Natural-language description, built for the grasping hand(s)
+        # (is_lhand/is_rhand above).  None when no descriptions are loaded or the
+        # subclass doesn't provide text.
+        text = self._sg_text(seq_idx, is_lhand, is_rhand)
+        if text is not None:
+            item["text"] = text
+        return item
 
     # ------------------------------------------------------------------- hooks
     # Indexed per grasp, not per sequence (mirrors the per-grasp __getitem__).
