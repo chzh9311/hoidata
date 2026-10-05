@@ -41,6 +41,136 @@ from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 ROT_REPR = "pytorch3d_6d"
 
 
+#: Half-width (frames) of a transition-action window, centred on a grasp-count
+#: change: the TA spans ``[p - TA_HALF, p + TA_HALF)`` (2*TA_HALF frames total).
+TA_HALF = 5
+
+#: Minimum length (frames) of a stable-grasp (or null) segment left between two
+#: transition windows.  When two change points are closer than
+#: ``2*TA_HALF + MIN_SEG`` their windows would leave less than this between them;
+#: rather than merge into one long transition, the two transitions are split at
+#: the midpoint of the change points, back to back.
+MIN_SEG = 5
+
+#: Backwards-compatible alias: the old "short null gap" absorb threshold now maps
+#: onto the minimum-segment split threshold above.
+MIN_NULL = MIN_SEG
+
+
+def _coalesce_intervals(segs, N):
+    """Merge touching / overlapping ``[s, e)`` intervals, clamped to ``[0, N)``.
+
+    Abutting grasps (``[a, m)`` then ``[m, b)``) describe one continuous grasp;
+    without merging the shared frame reads as a spurious release+regrasp.
+    """
+    iv = sorted((max(0, min(int(s), N)), max(0, min(int(e), N)))
+                for s, e in (segs or []))
+    iv = [(s, e) for s, e in iv if e > s]
+    out = []
+    for s, e in iv:
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def grasp_count_and_masks(grasps, N):
+    """Per-frame grasp count and per-hand boolean masks over ``[0, N)``.
+
+    Returns ``(count, lc, rc)`` where ``count`` is int8 (0/1/2) and ``lc``/``rc``
+    are bool arrays of whether the left / right hand is in stable grasp at each
+    frame, from the coalesced per-side intervals.
+    """
+    N = int(N)
+    lc = np.zeros(N, dtype=bool)
+    rc = np.zeros(N, dtype=bool)
+    if grasps:
+        for s, e in _coalesce_intervals(grasps.get("left", []), N):
+            lc[s:e] = True
+        for s, e in _coalesce_intervals(grasps.get("right", []), N):
+            rc[s:e] = True
+    count = lc.astype(np.int8) + rc.astype(np.int8)
+    return count, lc, rc
+
+
+def segment_grasp_timeline(grasps, N, ta_half=TA_HALF, min_seg=MIN_SEG,
+                           min_null=None):
+    """Split a sequence into null / transition / stable-grasp action segments.
+
+    From the per-side stable-grasp intervals, build the grasp-*count* timeline
+    (0 = no hand in stable grasp, 1 = one hand, 2 = both).  A **transition
+    action** (TA) is the ``ta_half`` frames either side of every frame where the
+    count changes among {null, one-hand, both-hand} — i.e. ``[p-ta_half,
+    p+ta_half)`` around each count-change point ``p``.  Every non-TA frame is
+    **null** (count 0) or **stable_grasp** (count >= 1).
+
+    When two consecutive change points ``p_i < p_{i+1}`` are **close** — closer
+    than ``2*ta_half + min_seg``, so their windows would leave fewer than
+    ``min_seg`` frames of stable-grasp / null between them — the two transitions
+    are **split** rather than merged: window ``i`` ends and window ``i+1`` begins
+    at the midpoint ``(p_i + p_{i+1}) // 2``, giving two back-to-back transition
+    segments (no null/stable_grasp between them).  When they are far enough apart,
+    the windows keep their full ``±ta_half`` extent and the middle is filled by
+    the grasp count (null or stable_grasp).
+
+    Touching / overlapping same-hand intervals are coalesced first so an abutting
+    boundary is not read as a spurious release+regrasp count flicker.
+
+    ``min_null`` is a deprecated alias for ``min_seg`` (kept for old callers).
+
+    Returns a list of contiguous ``{"start", "end", "type"}`` segments covering
+    ``[0, N)``, ``type`` in ``{"null", "transition", "stable_grasp"}``.
+    """
+    if min_null is not None:
+        min_seg = min_null
+    N = int(N)
+    if N <= 0:
+        return []
+
+    count, _lc, _rc = grasp_count_and_masks(grasps, N)
+
+    # Change points, then per-window [start, end) around each (clamped to [0, N)).
+    changes = list(np.nonzero(count[1:] != count[:-1])[0] + 1)  # frames p that step
+    starts = [max(0, p - ta_half) for p in changes]
+    ends = [min(N, p + ta_half) for p in changes]
+
+    # For each adjacent pair, decide split-vs-separate.  "Close" pairs (change
+    # points nearer than 2*ta_half + min_seg) abut at the midpoint of the two
+    # change points; well-separated pairs keep their full windows and leave the
+    # count-driven segment between them.  A split midpoint is recorded as a forced
+    # segment boundary so the two abutting transitions stay two segments (they
+    # would otherwise run-length-encode into one indistinguishable band).
+    cuts = set()
+    for i in range(len(changes) - 1):
+        if changes[i + 1] - changes[i] < 2 * ta_half + min_seg:
+            mid = (changes[i] + changes[i + 1]) // 2
+            ends[i] = mid
+            starts[i + 1] = mid
+            cuts.add(int(mid))
+
+    # Paint the TA mask from the (possibly split) windows.
+    is_ta = np.zeros(N, dtype=bool)
+    for s, e in zip(starts, ends):
+        if e > s:
+            is_ta[s:e] = True
+
+    # Per-frame type, then run-length encode into contiguous segments, forcing a
+    # break at every split midpoint so back-to-back transitions remain separate.
+    seg_type = np.where(
+        is_ta, "transition",
+        np.where(count == 0, "null", "stable_grasp")).astype(object)
+
+    segments = []
+    a = 0
+    for f in range(1, N + 1):
+        if f == N or seg_type[f] != seg_type[a] or f in cuts:
+            segments.append({"start": int(a), "end": int(f),
+                             "type": str(seg_type[a])})
+            a = f
+    return segments
+
+
 def _check_rot_repr(data, data_path):
     """Reject a preprocessed .npz whose rot6d convention is not ``ROT_REPR``."""
     repr_name = str(data["rot_repr"]) if "rot_repr" in data.files else None
@@ -790,6 +920,15 @@ class StableGraspMotionDataset(MotionDatasetBase):
             "seq_idx": [], "start_frame": [], "end_frame": [],
             "hand_side": [], "obj_name": [], "is_lhand": [], "is_rhand": [],
         }
+        self._build_index()
+
+    def _build_index(self):
+        """Populate ``self.stable_grasps`` (the flat clip index).
+
+        Default: bimanual segments when ``self.bimanual`` else one clip per CSV
+        row.  Subclasses (e.g. segmented-motion) override to build a different
+        set of clips into the same flat index.
+        """
         if self.bimanual:
             self._build_bimanual_stable_grasps()
         else:

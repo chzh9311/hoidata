@@ -14,6 +14,9 @@ const scrub = document.getElementById('scrub');
 const segAction = document.getElementById('segAction');
 const segLeft = document.getElementById('segLeft');
 const segRight = document.getElementById('segRight');
+const segSeg = document.getElementById('segSeg');
+const trackSeg = document.getElementById('trackSeg');
+const segLegend = document.getElementById('segLegend');
 const playheadLine = document.querySelector('#playhead .line');
 const activeLabelEl = document.getElementById('activeLabel');
 
@@ -72,6 +75,7 @@ window.addEventListener('resize', resize);
 // One entry per rendered mesh: { mesh, positions (Float32Array T*V*3), V,
 //   baseColor (THREE.Color) }.
 let meshes = [];
+let staticMeshes = [];         // non-animated scene geometry (e.g. the table top)
 let nframes = 0;
 let frameIdx = 0;
 let playing = true;
@@ -82,6 +86,8 @@ let loading = false;
 let labels = [];              // [{start, end, hand, action}]
 let labelColors = {};          // {left|right|both -> [r,g,b] 0..1}
 let grasps = { left: [], right: [] };  // stable-grasp intervals per side
+let segments = [];             // [{start, end, type}] action-split track
+let segmentColors = {};        // {null|transition|stable_grasp -> [r,g,b] 0..1}
 let activeLabelIdx = -1;       // which label is highlighted right now (-1 none)
 let segEls = [];               // DOM nodes for each action label's colored block
 
@@ -93,12 +99,13 @@ let edEnd = null;              // pending out-point (exclusive frame) or null
 let selBandEl = null;          // translucent band on the action lane (in/out preview)
 
 function clearMeshes() {
-  for (const m of meshes) {
+  for (const m of meshes.concat(staticMeshes)) {
     scene.remove(m.mesh);
     m.mesh.geometry.dispose();
     m.mesh.material.dispose();
   }
   meshes = [];
+  staticMeshes = [];
 }
 
 function makeMesh(positionsFrame0, faces, colorArr, V, opacity = 1.0, vertexColors = false) {
@@ -160,7 +167,14 @@ function buildScene(meta, buffer) {
   labels = meta.labels || [];
   labelColors = meta.label_colors || {};
   grasps = meta.grasps || { left: [], right: [] };
+  segments = meta.segments || [];
+  segmentColors = meta.segment_colors || {};
   activeLabelIdx = -1;
+
+  // Show the action-split track + legend only when segments are provided.
+  const hasSegments = segments.length > 0;
+  if (trackSeg) trackSeg.hidden = !hasSegments;
+  if (segLegend) segLegend.hidden = !hasSegments;
 
   const arrays = meta.arrays;
   // When extra objects are overlaid in the same space (wrist-aligned view:
@@ -209,6 +223,20 @@ function buildScene(meta, buffer) {
       mesh: makeMesh(verts.subarray(0, V * 3), faces, ex.color, V, exOpacity),
       positions: verts, V,
       baseColor: new THREE.Color(...ex.color),
+    });
+  }
+
+  // Static table-top surface (0.5m x 0.5m quad, parallel to xOy) — drawn once,
+  // never touched by setFrame. Lives in staticMeshes so it still disposes and
+  // still contributes to the scene bbox.
+  if (arrays.table_verts && arrays.table_faces) {
+    const tVerts = viewArray(buffer, arrays.table_verts);            // (4, 3)
+    const tFaces = new Uint32Array(viewArray(buffer, arrays.table_faces));
+    const tV = arrays.table_verts.shape[0];
+    const tCol = meta.table_color || [0.45, 0.40, 0.35];
+    staticMeshes.push({
+      mesh: makeMesh(tVerts.subarray(0, tV * 3), tFaces, tCol, tV),
+      positions: tVerts, V: tV,
     });
   }
 
@@ -264,6 +292,17 @@ function renderTracks() {
     for (const [s, e] of (grasps[side] || [])) {
       container.appendChild(
         makeSegment(s, e, c, '', `${side} grasp  ${s}-${e}`));
+    }
+  }
+
+  // Bottom action-split track (--segmented): null / transition / stable_grasp.
+  if (segSeg) {
+    segSeg.innerHTML = '';
+    for (const s of segments) {
+      const c = segmentColors[s.type] || [0.5, 0.5, 0.5];
+      segSeg.appendChild(
+        makeSegment(s.start, s.end, c, '',
+          `${s.type.replace('_', ' ')}  ${s.start}-${s.end}`));
     }
   }
 }
@@ -444,7 +483,7 @@ function applyLabelHighlight(t) {
 function frameSceneToBBox() {
   let mn = [Infinity, Infinity, Infinity];
   let mx = [-Infinity, -Infinity, -Infinity];
-  for (const m of meshes) {
+  for (const m of meshes.concat(staticMeshes)) {
     const p = m.positions;
     for (let i = 0; i < p.length; i += 3) {
       for (let k = 0; k < 3; k++) {

@@ -50,6 +50,10 @@
           <span class="trackName">R grasp</span>
           <div class="lane"><div class="base"></div><div class="segs" id="segRight"></div></div>
         </div>
+        <div class="track" id="trackSeg" hidden>
+          <span class="trackName">action</span>
+          <div class="lane"><div class="base"></div><div class="segs" id="segSeg"></div></div>
+        </div>
         <div id="playhead"><div class="line"></div></div>
       </div>
       <span id="frameReadout">0 / 0</span>
@@ -58,6 +62,11 @@
       <span><i class="sw" style="background:#40bf59"></i>action</span>
       <span><i class="sw" style="background:#3373f2"></i>L grasp</span>
       <span><i class="sw" style="background:#e64040"></i>R grasp</span>
+      <span id="segLegend" hidden>
+        <i class="sw" style="background:#808080"></i>null
+        <i class="sw" style="background:#f2b333"></i>transition
+        <i class="sw" style="background:#40b366"></i>stable grasp
+      </span>
       <span id="activeLabel"></span>
     </div>
 

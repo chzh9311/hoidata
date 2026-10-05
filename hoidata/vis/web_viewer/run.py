@@ -37,17 +37,29 @@ from hoidata.vis.o3d_visualizer import (
     build_dataset, pose_sample, build_transition_dataset, pose_transition_sample,
     build_bimanual_transition_dataset, pose_bimanual_transition_sample,
     build_stable_grasp_dataset, pose_wrist_aligned_sample,
-    build_bimanual_stable_grasp_dataset, pose_bimanual_stable_grasp_sample)
+    build_bimanual_stable_grasp_dataset, pose_bimanual_stable_grasp_sample,
+    pose_segmented_sample, build_gigahands_dataset, pose_gigahands_sample)
 from hoidata.preprocess.preprocess_arctic import parse_description_labels
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
 OBJECT_COLOR = [0.6, 0.7, 0.9]
+
+# Table-top surface (drawn under the object at its first-frame resting height).
+TABLE_SIZE = 0.5                  # side length in meters (0.5m x 0.5m square)
+TABLE_COLOR = [0.45, 0.40, 0.35]  # muted brown
 
 # Progress-bar / active-label colors by annotated hand type (0..1 RGB).
 LABEL_COLORS = {
     "left":  [0.20, 0.45, 0.95],   # blue
     "right": [0.90, 0.25, 0.25],   # red
     "both":  [0.25, 0.75, 0.35],   # green
+}
+
+# Action-segmentation track colors (--segmented): gray = null grasp.
+SEGMENT_COLORS = {
+    "null":         [0.50, 0.50, 0.50],   # gray  — no hand in stable grasp
+    "transition":   [0.95, 0.70, 0.20],   # amber — transition action (±5 frames)
+    "stable_grasp": [0.25, 0.70, 0.40],   # green — one or both hands in stable grasp
 }
 
 app = Flask(__name__)
@@ -67,6 +79,7 @@ STATE = {
     "bimanual": False,   # True → GRAB bimanual (merged-hand) transition dataset
     "wrist_aligned": False,  # True → wrist-frame original vs. reconstructed object
     "stable_grasp": False,   # True → world-frame bimanual stable-grasp segments
+    "segmented": False,      # True → full sequence + null/transition/SG action track
     "label_mode": False,     # True → action-label editing enabled (ARCTIC only)
     "label_dir": None,        # working-copy dir for editable description.txt files
     "seq_meta": [],           # index -> {subject, action_name, nframes} (label mode)
@@ -216,6 +229,26 @@ def _build_sequence_list(ds, transition=False, wrist_aligned=False,
     return seqs
 
 
+def _build_gigahands_sequence_list(ds):
+    """Dropdown metadata for the GigaHands dataset (no MANO/GPU posing).
+
+    Each index is a full clip; the label is the object name plus the caption, and
+    the length comes from the cheap ``clip_meta`` (tracked-frame window).
+    """
+    seqs = []
+    for i in range(len(ds)):
+        m = ds.clip_meta(i)
+        obj = m["obj_name"]
+        label = f"{obj} | {m['text']}" if m["text"] else (obj or m["seq_name"])
+        seqs.append({
+            "index": i,
+            "obj_name": str(obj),
+            "action_name": label,
+            "nframes": int(m["nframes"]),
+        })
+    return seqs
+
+
 def _serialize_sample(sample):
     """Pack a posed sample into (meta_dict, blob_bytes).
 
@@ -285,6 +318,41 @@ def _serialize_sample(sample):
         for side in ("left", "right")
     }
 
+    # Optional action-segmentation track (null / transition / stable_grasp).
+    segments = [
+        {"start": int(s["start"]), "end": int(s["end"]), "type": str(s["type"])}
+        for s in sample.get("segments", [])
+    ]
+
+    # Table-top surface: a 0.5m x 0.5m square lying in a horizontal plane, placed
+    # so the object rests on it in the reference frame — the "up" axis is the one
+    # normal to that plane, and the table sits at the object's lowest coordinate
+    # along it, centered on the object's centroid in the other two axes. The plane
+    # is per-dataset (``cfg.table_plane``): "xoy" (up=z, default) for GRAB/ARCTIC,
+    # "xoz" (up=y) for GigaHands. Shipped as a static (non-animated) quad.
+    #
+    # The reference frame is the first frame where the object is actually tracked
+    # (``table_frame`` from the sample; defaults to 0). GigaHands leaves untracked
+    # frames at the origin, so a blind frame-0 would drop the table at (0,0,0) —
+    # away from the real scene and penetrating it.
+    table_frame = int(sample.get("table_frame", 0) or 0)
+    table_frame = max(0, min(table_frame, obj_verts.shape[0] - 1))
+    ov0 = obj_verts[table_frame]                           # (Vo, 3)
+    # up_axis is normal to the table plane; the other two axes span the square.
+    up_axis = 1 if str(STATE["cfg"].get("table_plane", "xoy")).lower() == "xoz" else 2
+    a0, a1 = [ax for ax in (0, 1, 2) if ax != up_axis]     # the two spanning axes
+    up_val = float(ov0[:, up_axis].min())
+    c0, c1 = float(ov0[:, a0].mean()), float(ov0[:, a1].mean())
+    h = TABLE_SIZE / 2.0
+    table_verts = np.zeros((4, 3), dtype=np.float32)
+    table_verts[:, up_axis] = up_val
+    for k, (s0, s1) in enumerate([(-h, -h), (h, -h), (h, h), (-h, h)]):
+        table_verts[k, a0] = c0 + s0
+        table_verts[k, a1] = c1 + s1
+    table_faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    _add("table_verts", table_verts, np.float32)
+    _add("table_faces", table_faces, np.int32)
+
     meta = {
         "nframes": nframes,
         "hand_sides": hand_sides,
@@ -297,6 +365,9 @@ def _serialize_sample(sample):
         "label_colors": LABEL_COLORS,
         "labels": labels,
         "grasps": grasps,
+        "segments": segments,
+        "segment_colors": SEGMENT_COLORS,
+        "table_color": TABLE_COLOR,
         "extras": [
             {"name": ex["name"], "color": list(ex["color"]),
              "opacity": float(ex.get("opacity", 0.5))}
@@ -313,7 +384,12 @@ def _get_sequence_payload(index):
     """Return (meta, blob) for a sequence, posing + caching on first request."""
     if index in STATE["cache"]:
         return STATE["cache"][index]
-    if STATE["stable_grasp"]:
+    if STATE["segmented"]:
+        sample = pose_segmented_sample(
+            STATE["cfg"], STATE["dataset_name"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    elif STATE["stable_grasp"]:
         sample = pose_bimanual_stable_grasp_sample(
             STATE["cfg"], STATE["ds"],
             STATE["lhand_layer"], STATE["rhand_layer"], index,
@@ -330,6 +406,11 @@ def _get_sequence_payload(index):
         )
     elif STATE["transition"]:
         sample = pose_transition_sample(
+            STATE["cfg"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    elif STATE["dataset_name"] == "gigahands":
+        sample = pose_gigahands_sample(
             STATE["cfg"], STATE["ds"],
             STATE["lhand_layer"], STATE["rhand_layer"], index,
         )
@@ -452,6 +533,11 @@ def main():
                              "(BimanualStableGraspGRAB) in the WORLD frame: hands "
                              "and object shown as-is per segment, no wrist "
                              "alignment and no 1-DOF fit. GRAB config only.")
+    parser.add_argument("--segmented", action="store_true",
+                        help="View full GRAB sequences with an action-split track "
+                             "at the bottom: null grasp (gray) / transition action "
+                             "(+-5 frames around each grasp-count change) / stable "
+                             "grasp. GRAB config only.")
     parser.add_argument("--label", action="store_true",
                         help="Enable action-label editing (ARCTIC full_motion only). "
                              "Edits persist to data/{dataset}_description/ and sync "
@@ -462,19 +548,25 @@ def main():
     dataset_name = cfg.name
 
     view_modes = [args.transition, args.bimanual, args.wrist_aligned,
-                  args.stable_grasp]
+                  args.stable_grasp, args.segmented]
     if sum(bool(m) for m in view_modes) > 1:
         parser.error("--transition / --bimanual / --wrist-aligned / --stable-grasp "
-                     "are mutually exclusive.")
+                     "/ --segmented are mutually exclusive.")
 
     if args.label:
         if dataset_name != "arctic" or not cfg.get("full_motion", False):
             parser.error("--label is only supported for the ARCTIC full_motion config.")
         if any(view_modes):
             parser.error("--label cannot be combined with --transition / "
-                         "--bimanual / --wrist-aligned / --stable-grasp.")
+                         "--bimanual / --wrist-aligned / --stable-grasp / --segmented.")
 
-    if args.stable_grasp:
+    if args.segmented:
+        if dataset_name != "grab":
+            parser.error("--segmented is only supported for the GRAB config.")
+        print(f"Building GRAB dataset (split={args.split}) for the "
+              f"segmented action view ...")
+        ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
+    elif args.stable_grasp:
         if dataset_name != "grab":
             parser.error("--stable-grasp is only supported for the GRAB config.")
         print(f"Building GRAB bimanual stable-grasp dataset (split={args.split}) "
@@ -502,12 +594,22 @@ def main():
               f"aug_p={aug_p}) ...")
         ds, lhand_layer, rhand_layer = build_transition_dataset(
             cfg, args.split, aug_p=aug_p)
+    elif dataset_name == "gigahands":
+        if any(view_modes):
+            parser.error("--transition / --bimanual / --wrist-aligned / "
+                         "--stable-grasp / --segmented are not supported for the "
+                         "GigaHands config; use the plain world-frame view.")
+        print(f"Building GigaHands dataset (split={args.split}) ...")
+        ds, lhand_layer, rhand_layer = build_gigahands_dataset(cfg, args.split)
     else:
         print(f"Building dataset ({dataset_name}, split={args.split}) ...")
         ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
-    sequences = _build_sequence_list(
-        ds, transition=args.transition or args.bimanual,
-        wrist_aligned=args.wrist_aligned, stable_grasp=args.stable_grasp)
+    if dataset_name == "gigahands":
+        sequences = _build_gigahands_sequence_list(ds)
+    else:
+        sequences = _build_sequence_list(
+            ds, transition=args.transition or args.bimanual,
+            wrist_aligned=args.wrist_aligned, stable_grasp=args.stable_grasp)
 
     label_dir = _ensure_label_dir(cfg, dataset_name) if args.label else None
     seq_meta = _build_seq_meta(ds) if args.label else []
@@ -526,12 +628,14 @@ def main():
         "bimanual": args.bimanual,
         "wrist_aligned": args.wrist_aligned,
         "stable_grasp": args.stable_grasp,
+        "segmented": args.segmented,
         "label_mode": args.label,
         "label_dir": label_dir,
         "seq_meta": seq_meta,
     })
 
-    kind = ("bimanual stable grasps" if args.stable_grasp
+    kind = ("segmented sequences" if args.segmented
+            else "bimanual stable grasps" if args.stable_grasp
             else "stable grasps" if args.wrist_aligned
             else "bimanual transitions" if args.bimanual
             else "transitions" if args.transition else "sequences")

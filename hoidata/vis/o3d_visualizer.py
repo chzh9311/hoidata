@@ -14,10 +14,12 @@ import trimesh
 import open3d as o3d
 from omegaconf import OmegaConf
 
-from hoidata.dataloaders.action_dataset import ObjectModel
+from hoidata.dataloaders.action_dataset import (
+    ObjectModel, segment_grasp_timeline, TA_HALF, MIN_NULL)
 from hoidata.dataloaders.grab_dataset import (
     MotionGRAB, TransitionMotionGRAB, BimanualTransitionMotionGRAB,
-    StableGraspGRAB, BimanualStableGraspGRAB)
+    StableGraspGRAB, BimanualStableGraspGRAB,
+    load_grab_sbj_info, SubjectManoLayers)
 from hoidata.dataloaders.arctic_dataset import MotionARCTIC, StableGraspARCTIC
 from hoidata.utils.hand_proc import ManoLayerWrapper
 from hoidata.utils.proc import process_obj_result, proc_torch_cuda, proc_numpy
@@ -106,7 +108,186 @@ def build_dataset(cfg, dataset_name: str, split: str = "test"):
         lhand_layer=lhand_layer,
         rhand_layer=rhand_layer,
     )
+
+    # GRAB ships a per-subject shaped MANO hand template (tools/subject_meshes);
+    # install per-subject layers so the visualized hands match each subject's
+    # actual hand shape instead of the shared mean template.  ``_getitem_full``
+    # then picks the subject layer via ``_get_layers`` and poses with zero betas
+    # (the shape is baked into the template).
+    if dataset_name == "grab":
+        import os.path as _osp
+        subj_dir = cfg.get(
+            "subject_meshes_root",
+            _osp.join(_osp.dirname(cfg.root.rstrip("/")), "tools", "subject_meshes"),
+        )
+        sbj_info = load_grab_sbj_info(subj_dir)
+        if sbj_info:
+            ds.subject_layers = SubjectManoLayers(
+                sbj_info, mano_root=cfg.mano_root, flat_hand=cfg.flat_hand,
+                use_pca=use_pca,
+                default_layers={"left": lhand_layer, "right": rhand_layer},
+            )
+            print(f"[grab] using per-subject hand templates for "
+                  f"{len(sbj_info)} subjects ({sorted(sbj_info)})")
+        else:
+            print(f"[grab] no subject meshes under {subj_dir}; "
+                  f"falling back to the shared mean template")
+
     return ds, lhand_layer, rhand_layer
+
+
+def build_gigahands_dataset(cfg, split: str = "test"):
+    """Build the MANO layers and the GigaHands dataset for the viewer.
+
+    GigaHands stores its own MANO params (converted to this repo's x-data on the
+    fly), so the dataset needs no preprocessed ``.npz``.  The subset filters
+    (``object_number`` / ``object_rigidity``) and the object requirement are read
+    from the config; the viewer only shows sequences that actually have an object
+    trajectory, so ``require_object`` is forced on.
+
+    Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    from hoidata.dataloaders.gigahands_dataset import MotionGigaHands
+
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.get("flat_hand", False),
+        mano_root=cfg.mano_root, use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.get("flat_hand", False),
+        mano_root=cfg.mano_root, use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+
+    ds = MotionGigaHands(
+        dataset_root=cfg.get("dataset_root", "data/GigaHands"),
+        split=split,
+        object_number=cfg.get("object_number", None),
+        object_rigidity=cfg.get("object_rigidity", "rigid"),
+        require_object=True,
+        smooth_object=cfg.get("smooth_object", True),
+        sequence_type_file=cfg.get("sequence_type_file", None),
+        annotation_file=cfg.get("annotation_file", None),
+        # The EasyMocap->manopth root-pivot correction in the dataset computes J0
+        # with these layer settings; they MUST match the posing layers above or
+        # the corrected translation won't line up with the rendered hand.
+        mano_root=cfg.mano_root,
+        flat_hand=cfg.get("flat_hand", False),
+    )
+    return ds, lhand_layer, rhand_layer
+
+
+def _pose_hand_with_beta(x_hand, beta, layer):
+    """(T, 99) x-data + (10,) beta -> (T, 778, 3) world-space MANO vertices.
+
+    Unlike ``transform_xdata_to_verts`` (which assumes a zero shape), this uses
+    the per-sequence GigaHands beta so the posed hand matches the fitted shape.
+    """
+    import torch
+    from pytorch3d.transforms import matrix_to_axis_angle, rotation_6d_to_matrix
+
+    xd = proc_torch_cuda(np.asarray(x_hand, dtype=np.float32))
+    T = xd.shape[0]
+    pose = matrix_to_axis_angle(
+        rotation_6d_to_matrix(xd[:, 3:].reshape(-1, 6))).reshape(T, 48)
+    betas = proc_torch_cuda(np.asarray(beta, dtype=np.float32)).reshape(1, -1)[:, :10]
+    betas = betas.expand(T, 10).contiguous()
+    out = layer(pose, betas, xd[:, :3])
+    return proc_numpy(out.vertices).astype(np.float32)
+
+
+def _pose_gigahands_object(cfg, item):
+    """Load and pose the GigaHands object mesh per frame from the item's x_obj.
+
+    ``x_obj`` is (T, 9) trans + rot6d holding the object's extrinsic matrix in
+    GigaHands' convention (rotation ``R`` from ``_pytorch3d_quat_to_rotmat``); the
+    mesh is placed as ``v @ R^T + t`` per frame — the same transform the reference
+    loader applies (``base_v @ T[:3,:3].T + T[:3,3]``).
+
+    Returns ``(obj_verts (T, V, 3), obj_faces (F, 3))``, or ``(None, None)`` when
+    no mesh is available.
+    """
+    from pytorch3d.transforms import rotation_6d_to_matrix
+
+    mesh_path = item.get("obj_mesh")
+    x_obj = item.get("x_obj")
+    if mesh_path is None or x_obj is None:
+        return None, None
+
+    mesh = trimesh.load(mesh_path, process=False, force="mesh")
+    verts = np.asarray(mesh.vertices, dtype=np.float32)               # (V, 3)
+    faces = np.asarray(mesh.faces)
+
+    x_obj = np.asarray(x_obj, dtype=np.float32)[: item["nframes"]]
+    trans = x_obj[:, :3]                                              # (T, 3)
+    R = proc_numpy(rotation_6d_to_matrix(
+        proc_torch_cuda(x_obj[:, 3:]).reshape(-1, 6)))                # (T, 3, 3)
+    # v @ R^T + t   (== apply R^T, matching the reference object transform).
+    obj_verts = (np.einsum("vj,tij->tvi", verts, R)
+                 + trans[:, None, :]).astype(np.float32)              # (T, V, 3)
+    return obj_verts, faces
+
+
+def pose_gigahands_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Pose one GigaHands clip (hands + object) in the world frame for the viewer.
+
+    Hands are built from ``x_lhand`` / ``x_rhand`` with the sequence's own MANO
+    betas; only the tracked hands (``is_lhand`` / ``is_rhand``) are drawn.  The
+    object mesh is loaded from ``object_meta`` and posed from ``x_obj``.
+    """
+    item = ds[index]
+    nframes = int(item["nframes"])
+
+    hand_sides = []
+    hand_blocks = []
+    if item["is_lhand"]:
+        hand_sides.append("left")
+        hand_blocks.append(_pose_hand_with_beta(
+            item["x_lhand"], item["lhand_beta"], lhand_layer))
+    if item["is_rhand"]:
+        hand_sides.append("right")
+        hand_blocks.append(_pose_hand_with_beta(
+            item["x_rhand"], item["rhand_beta"], rhand_layer))
+    # (T, 778*H, 3) matching the hand_sides order, or an empty (T,0,3) fallback.
+    hand_verts = (np.concatenate(hand_blocks, axis=1)
+                  if hand_blocks else np.zeros((nframes, 0, 3), np.float32))
+
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    obj_verts, obj_faces = _pose_gigahands_object(cfg, item)
+    if obj_verts is None:
+        # No mesh: a degenerate single-point object so the serializer stays happy.
+        obj_verts = np.zeros((nframes, 1, 3), np.float32)
+        obj_faces = np.zeros((0, 3), np.int64)
+
+    # Reference frame for the table: the first frame where the object is actually
+    # tracked.  GigaHands leaves untracked frames at the origin, so a blind
+    # frame-0 would place the object (and hence the table) at (0,0,0).
+    obj_valid = item.get("obj_valid")
+    table_frame = 0
+    if obj_valid is not None:
+        idxs = np.nonzero(np.asarray(obj_valid[:nframes]))[0]
+        if len(idxs):
+            table_frame = int(idxs[0])
+
+    return {
+        "hand_verts": hand_verts,
+        "hand_faces": hand_faces,
+        "hand_sides": hand_sides,
+        "obj_verts": obj_verts,
+        "obj_faces": obj_faces,
+        "nframes": nframes,
+        "obj_name": str(item.get("obj_name") or ""),
+        "action_name": str(item.get("text") or ""),
+        "labels": [],
+        "subject": item["seq_name"],
+        "grasps": {"left": [], "right": []},
+        "table_frame": table_frame,
+    }
 
 
 def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
@@ -681,6 +862,25 @@ def pose_bimanual_stable_grasp_sample(
         "subject": "",
         "grasps": {"left": [], "right": []},
     }
+
+
+# Grasp-timeline segmentation (segment_grasp_timeline / TA_HALF / MIN_NULL) lives
+# with the dataset machinery (imported at the top) so the viewer and
+# SegmentedMotionGRAB share one implementation.
+
+
+def pose_segmented_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer,
+                          index: int = 0) -> dict:
+    """Pose a full sequence and attach its null/transition/stable-grasp split.
+
+    Delegates to :func:`pose_sample` (world-frame full sequence, hands + object),
+    then adds a ``segments`` timeline computed from the item's stable-grasp
+    intervals (see :func:`segment_grasp_timeline`) for the viewer's bottom track.
+    """
+    sample = pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index)
+    grasps = sample.get("grasps", {"left": [], "right": []})
+    sample["segments"] = segment_grasp_timeline(grasps, sample["nframes"])
+    return sample
 
 
 def load_sample(cfg, dataset_name: str, split: str = "test", index: int = 0) -> dict:

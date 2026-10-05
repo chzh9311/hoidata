@@ -7,12 +7,80 @@ object hooks live here.
 
 import numpy as np
 
+import os.path as osp
 from .action_dataset import (
-    MotionDatasetBase, MotionDataModuleBase, StableGraspMotionDataset)
+    MotionDatasetBase, MotionDataModuleBase, StableGraspMotionDataset,
+    segment_grasp_timeline, grasp_count_and_masks, TA_HALF, MIN_NULL)
 from hoidata.utils.proc import (
     pc_normalize, proc_numpy, proc_torch_cuda, process_text, process_obj_result)
 from hoidata.constants.grab_constants import grab_val_obj_name, grab_test_obj_name, grab_obj_name
 from hoidata.utils.contact_utils import calculate_contact_capsule
+
+
+# GRAB subjects s1..s10 split by gender under tools/subject_meshes/<gender>/.
+_GRAB_SUBJECT_GENDER = {
+    "s1": "male", "s2": "male", "s8": "male", "s9": "male", "s10": "male",
+    "s3": "female", "s4": "female", "s5": "female", "s6": "female", "s7": "female",
+}
+
+
+def load_grab_sbj_info(subject_meshes_dir):
+    """Load per-subject MANO hand vtemplates from GRAB's ``tools/subject_meshes``.
+
+    Each GRAB subject has its own shaped MANO hand template (its shape blend is
+    already baked into the mesh — ``s{N}_{l,r}hand.ply``, 778 verts, in the MANO
+    canonical frame, metres).  Returns ``{sbj_id: {"lh_vtemp": (778,3),
+    "rh_vtemp": (778,3)}}`` (float32), ready to drive a per-subject ``ManoLayer``
+    (posed with zero betas, since the shape is in the template).
+    """
+    import trimesh
+    info = {}
+    for sbj, gender in _GRAB_SUBJECT_GENDER.items():
+        gdir = osp.join(subject_meshes_dir, gender)
+        lh = osp.join(gdir, f"{sbj}_lhand.ply")
+        rh = osp.join(gdir, f"{sbj}_rhand.ply")
+        if not (osp.exists(lh) and osp.exists(rh)):
+            continue
+        lv = np.asarray(trimesh.load(lh, process=False).vertices, dtype=np.float32)
+        rv = np.asarray(trimesh.load(rh, process=False).vertices, dtype=np.float32)
+        info[sbj] = {"lh_vtemp": lv, "rh_vtemp": rv}
+    return info
+
+
+class SubjectManoLayers:
+    """Per-subject left/right ``ManoLayerWrapper`` cache keyed by GRAB subject id.
+
+    Each subject's layer is built with its shaped hand mesh as the MANO
+    ``v_template``, so posing with zero betas reproduces that subject's hand
+    shape.  ``get(sbj_id, side)`` returns the layer (falling back to the shared
+    default layer for unknown subjects), matching the interface expected by
+    ``MotionDatasetBase._get_layers``.
+    """
+
+    def __init__(self, sbj_info, mano_root, flat_hand=True, use_pca=False,
+                 default_layers=None, device="cuda"):
+        from hoidata.utils.hand_proc import ManoLayerWrapper
+
+        self._layers = {}
+        self._default = default_layers or {}
+        ncomps = 6 if use_pca else 45
+        for sbj, vt in sbj_info.items():
+            self._layers[sbj] = {
+                "left": ManoLayerWrapper(
+                    side="left", flat_hand_mean=flat_hand, mano_root=mano_root,
+                    use_pca=use_pca, ncomps=ncomps, v_template=vt["lh_vtemp"],
+                ).to(device),
+                "right": ManoLayerWrapper(
+                    side="right", flat_hand_mean=flat_hand, mano_root=mano_root,
+                    use_pca=use_pca, ncomps=ncomps, v_template=vt["rh_vtemp"],
+                ).to(device),
+            }
+
+    def get(self, sbj_id, side):
+        sbj = str(sbj_id)
+        if sbj in self._layers:
+            return self._layers[sbj][side]
+        return self._default.get(side)
 
 
 class MotionGRAB(MotionDatasetBase):
@@ -1025,4 +1093,181 @@ class BimanualStableGraspGRABDataModule(MotionGRABDataModule):
             subject_layers=self.subject_layers,
             stable_grasp_csv=dc.get("stable_grasp_csv"),
             min_len=min_len,
+        )
+
+
+class SegmentedMotionGRAB(StableGraspGRAB):
+    """GRAB clips of one action-*segment* type: stable grasp / transition / null.
+
+    Every sequence is split by :func:`segment_grasp_timeline` into contiguous
+    ``null`` (no hand in stable grasp), ``transition`` (a grasp-count change ±
+    ``ta_half`` frames, short intervening null gaps absorbed) and ``stable_grasp``
+    (one or both hands in stable grasp) segments.  ``segment_type`` (set in
+    ``__init__``) selects which of the three this dataset yields — one clip per
+    matching segment at least ``min_len`` frames long.
+
+    ``segment_type`` accepts ``"stable_grasp"`` / ``"transition"`` / ``"null"``
+    (aliases ``"sg"``, ``"ta"``, ``"null"`` — case-insensitive).
+
+    Each item exposes **both** hands' raw windows (``x_lhand`` / ``x_rhand``, each
+    ``(Tt, 99)``; GRAB always stores both), the object window ``x_object``
+    ``(Tt, 9)``, ``n_frames``, ``segment_type``, ``is_lhand`` / ``is_rhand``
+    (which hands are **available** in the parent sequence), and ``hand_side``
+    (which hand(s) are in **stable grasp** at the segment mid-frame — "left" /
+    "right" / "both", or "none" for a ``null`` clip).
+    """
+
+    #: segment_type aliases → canonical timeline label.
+    _SEG_ALIASES = {
+        "stable_grasp": "stable_grasp", "sg": "stable_grasp", "grasp": "stable_grasp",
+        "transition": "transition", "ta": "transition",
+        "null": "null", "none": "null",
+    }
+
+    def __init__(self, *args, segment_type="stable_grasp",
+                 ta_half=TA_HALF, min_null=MIN_NULL, min_len=0, **kwargs):
+        key = str(segment_type).strip().lower()
+        if key not in self._SEG_ALIASES:
+            raise ValueError(
+                f"segment_type must be one of stable_grasp/transition/null "
+                f"(or sg/ta), got {segment_type!r}")
+        self.segment_type = self._SEG_ALIASES[key]
+        self.ta_half = int(ta_half)
+        self.min_null = int(min_null)
+        # min_len drops segments shorter than this; reuse the base attribute.
+        super().__init__(*args, min_len=min_len, **kwargs)
+
+    def _build_index(self):
+        """One clip per segment of the selected ``segment_type``.
+
+        Runs the grasp-timeline segmentation per sequence and keeps segments whose
+        ``type`` matches and whose length is >= ``min_len``.  For each kept
+        segment the flat index records:
+          - ``hand_side``  — which hand(s) are in **stable grasp** at the segment
+            mid-frame ("left"/"right"/"both", or "none" for a null clip);
+          - ``is_lhand`` / ``is_rhand`` — which hands are **available** in the
+            parent sequence (its per-sequence presence flags).
+        """
+        from hoidata.preprocess.preprocess_arctic import load_stable_grasps
+
+        if not self.stable_grasp_csv:
+            raise ValueError(
+                f"{type(self).__name__} requires `stable_grasp_csv` "
+                "(path to the stable-grasp CSV).")
+
+        grasps = load_stable_grasps(self.stable_grasp_csv)
+
+        sg = self.stable_grasps
+        for seq_idx in range(len(self.nframes)):
+            key = self._sg_seq_key(seq_idx)
+            if key not in grasps:
+                continue
+            N = int(self.nframes[seq_idx])
+            obj_name = self._sg_obj_name(seq_idx)
+            avail_l = bool(self.is_lhand[seq_idx])   # hands available in this seq
+            avail_r = bool(self.is_rhand[seq_idx])
+            g = {"left": grasps[key]["left"], "right": grasps[key]["right"]}
+            _count, lc, rc = grasp_count_and_masks(g, N)
+            segments = segment_grasp_timeline(
+                g, N, ta_half=self.ta_half, min_null=self.min_null)
+            for seg in segments:
+                if seg["type"] != self.segment_type:
+                    continue
+                a, b = seg["start"], seg["end"]
+                if b - a < self.min_len:
+                    continue
+                mid = (a + b) // 2
+                sg_l = bool(lc[mid])                  # in stable grasp at mid-frame
+                sg_r = bool(rc[mid])
+                cnt = int(sg_l) + int(sg_r)
+                side = ("both" if cnt == 2 else
+                        "left" if sg_l else "right" if sg_r else "none")
+                sg["seq_idx"].append(seq_idx)
+                sg["start_frame"].append(a)
+                sg["end_frame"].append(b)
+                sg["hand_side"].append(side)         # stable-grasp hand(s)
+                sg["obj_name"].append(obj_name)
+                sg["is_lhand"].append(avail_l)       # hand availability
+                sg["is_rhand"].append(avail_r)
+
+    def __getitem__(self, index):
+        """One segment clip: both hands' windows + object + ``segment_type``.
+
+        Unlike the stable-grasp base (which gates the hand windows on grasp
+        presence), a segment clip always returns both hands' raw ``(Tt, 99)``
+        windows — the hands move even in ``null`` / ``transition`` segments where
+        neither is in stable grasp.  ``is_lhand`` / ``is_rhand`` report which hands
+        are **available** in the parent sequence; ``hand_side`` reports which
+        hand(s) are in **stable grasp** at the segment mid-frame ("left" / "right"
+        / "both" / "none").
+        """
+        sg = self.stable_grasps
+        seq_idx = sg["seq_idx"][index]
+        a = sg["start_frame"][index]
+        b = sg["end_frame"][index]
+        is_lhand = bool(sg["is_lhand"][index])       # hand availability
+        is_rhand = bool(sg["is_rhand"][index])
+        hand_side = str(sg["hand_side"][index])      # stable-grasp hand(s)
+
+        x_lhand = np.asarray(self.x_lhand[seq_idx][a:b], dtype=np.float32)   # (Tt,99)
+        x_rhand = np.asarray(self.x_rhand[seq_idx][a:b], dtype=np.float32)   # (Tt,99)
+        x_object = np.asarray(self.x_obj[seq_idx][a:b], dtype=np.float32)    # (Tt,9)
+
+        item = {
+            "x_lhand":     x_lhand,
+            "x_rhand":     x_rhand,
+            "x_object":    x_object,
+            "segment_type": self.segment_type,
+            "hand_side":   hand_side,
+            "is_lhand":    is_lhand,
+            "is_rhand":    is_rhand,
+            "obj_name":    str(sg["obj_name"][index]),
+            "seq_idx":     int(seq_idx),
+            "start_frame": int(a),
+            "end_frame":   int(b),
+            "n_frames":    b - a,
+        }
+        # Description for the stable-grasp hand(s) — built from hand_side (which
+        # hand is grasping), not availability; only meaningful for a stable-grasp
+        # segment (null/transition has no single stable-grasp action).
+        if self.segment_type == "stable_grasp":
+            sg_l = hand_side in ("left", "both")
+            sg_r = hand_side in ("right", "both")
+            text = self._sg_text(seq_idx, sg_l, sg_r)
+            if text is not None:
+                item["text"] = text
+        return item
+
+
+class SegmentedMotionGRABDataModule(MotionGRABDataModule):
+    """LightningDataModule wrapping :class:`SegmentedMotionGRAB`.
+
+    Same preprocessing / split machinery and CSV path as
+    :class:`StableGraspGRABDataModule`.  ``segment_type`` (which of stable_grasp /
+    transition / null to yield) comes from ``cfg.segment_type`` (default
+    ``"stable_grasp"``); ``ta_half`` / ``min_null`` / the minimum clip length come
+    from the config (``ta_half`` / ``segment_min_null`` / ``stable_grasp_min_len``).
+    """
+
+    dataset_cls = SegmentedMotionGRAB
+
+    def _make_dataset(self, split: str):
+        dc = self.cfg
+        return self.dataset_cls(
+            data_path=dc.data_path,
+            data_obj_pc_path=dc.data_obj_pc_path,
+            text_json=dc.text_json,
+            max_nframes=-1,          # per-segment clips; no windowing
+            data_ratio=dc.get("data_ratio", 1.0),
+            task=self.task,
+            split=split,
+            lhand_layer=self.lhand_layer,
+            rhand_layer=self.rhand_layer,
+            subject_layers=self.subject_layers,
+            stable_grasp_csv=dc.get("stable_grasp_csv"),
+            segment_type=dc.get("segment_type", "stable_grasp"),
+            ta_half=dc.get("ta_half", TA_HALF),
+            min_null=dc.get("segment_min_null", MIN_NULL),
+            min_len=dc.get("stable_grasp_min_len",
+                           dc.get("transition_min_len", 0)),
         )

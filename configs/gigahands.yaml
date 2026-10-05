@@ -1,0 +1,27 @@
+name: "gigahands"
+dataset_root: "data/GigaHands"                 # annotations_v2.jsonl, hand_poses/, object_poses/
+annotation_file: "data/GigaHands/annotations_v2.jsonl"
+sequence_type_file: "data/GigaHands/sequence_type.json"  # single/multi-object taxonomy
+
+# --- subset selection -------------------------------------------------------
+# object_number: null (no filter) | single | multiple
+#   single   -> keep only clips the taxonomy labels 'single-object'
+#   multiple -> keep only clips labeled 'multi-object'
+object_number: single
+# object_rigidity: rigid (default) | deformable | null (no filter)
+#   rigid      -> keep only clips labeled 'rigid'
+#   deformable -> keep only clips labeled 'deformable'
+# With both object_number and object_rigidity set, the kept set is their intersection.
+object_rigidity: rigid
+require_object: True    # drop clips with no tracked object pose
+smooth_object: True      # smooth / interpolate object trajectories
+
+# --- viewer -----------------------------------------------------------------
+# table_plane: which horizontal plane the web-viewer table lies in.
+#   xoy -> up = z (GRAB/ARCTIC default);  xoz -> up = y (GigaHands' world frame).
+table_plane: xoz
+
+# --- MANO -------------------------------------------------------------------
+mano_root: "/home/zxc417/data/mano_v1_2/models"
+flat_hand: False         # GigaHands MANO params are fit WITHOUT the flat-hand mean
+use_pca: False

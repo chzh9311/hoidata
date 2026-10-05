@@ -92,6 +92,42 @@
             ]
         },
         {
+            // Launch the web viewer on full GRAB sequences with the action-split
+            // track (null / transition / stable grasp) at the bottom.
+            // Breakpoints: o3d_visualizer.py -> segment_grasp_timeline /
+            // pose_segmented_sample.
+            "name": "Debug segmented action viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": [
+                "--config", "configs/grab.yaml",
+                "--split", "test",
+                "--segmented"
+            ]
+        },
+        {
+            // Launch the web viewer on the GigaHands dataset (world-frame hands +
+            // object). Breakpoints: o3d_visualizer.py -> pose_gigahands_sample /
+            // _pose_gigahands_object and gigahands_dataset.py -> MotionGigaHands.
+            "name": "Debug GigaHands viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": [
+                "--config", "configs/gigahands.yaml",
+                "--split", "test"
+            ]
+        },
+        {
             // Same viewer, but let you type extra args at launch (e.g. a
             // different --split / --port) via the arg picker.
             "name": "Debug wrist-aligned viewer (pick args)",
