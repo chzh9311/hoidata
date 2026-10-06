@@ -52,3 +52,23 @@ class ManoLayerWrapper(ManoLayer):
         joints /= 1000.0  # mm → m
         joints_w_tip = joints[:, _JOINT_REORDER]
         return ManoOutput(vertices=verts, joints_w_tip=joints_w_tip)
+
+
+def fix_mano_left_shapedirs(lhand_layer, rhand_layer):
+    """Fix the sign bug in the official ``MANO_LEFT.pkl`` shape blend shapes.
+
+    The released left-hand model has its first shape direction's x-component
+    sign-flipped relative to the right hand, so non-zero betas deform the left
+    hand wrongly (https://github.com/vchoutas/smplx/issues/48).  Datasets fit
+    with the corrected model (e.g. HOT3D) need the same fix to reproduce their
+    hand shapes.  Detection mirrors HOT3D's ``MANOHandModel``: if the left and
+    right ``shapedirs[:, 0, :]`` are (almost) identical, negate the left one.
+    Idempotent: a second call sees the already-fixed layer and does nothing.
+
+    Irrelevant when posing with zero betas (GRAB / ARCTIC x-data).
+    """
+    l_dirs = lhand_layer.th_shapedirs
+    r_dirs = rhand_layer.th_shapedirs.to(l_dirs.device)
+    if torch.sum(torch.abs(l_dirs[:, 0, :] - r_dirs[:, 0, :])) < 1:
+        l_dirs[:, 0, :] *= -1
+    return lhand_layer

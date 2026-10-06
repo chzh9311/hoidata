@@ -1,8 +1,9 @@
 """Local web app for interactive HOI (hand-object interaction) visualization.
 
-Serves a single-page Three.js viewer that plays a posed ARCTIC/GRAB sequence in
-a loop with play/pause, a draggable frame progress bar, a sequence dropdown, and
-prev/next buttons — with free mouse-drag camera orbit, matching the native
+Serves a single-page Three.js viewer that plays a posed ARCTIC/GRAB/GigaHands/
+HOT3D sequence in a loop with play/pause, a draggable frame progress bar, a
+sequence dropdown, and prev/next buttons — with free mouse-drag camera orbit,
+matching the native
 ``vis/o3d_visualizer.py`` window.
 
 The heavy lifting (dataset loading, MANO posing, object posing) is reused
@@ -38,7 +39,8 @@ from hoidata.vis.o3d_visualizer import (
     build_bimanual_transition_dataset, pose_bimanual_transition_sample,
     build_stable_grasp_dataset, pose_wrist_aligned_sample,
     build_bimanual_stable_grasp_dataset, pose_bimanual_stable_grasp_sample,
-    pose_segmented_sample, build_gigahands_dataset, pose_gigahands_sample)
+    pose_segmented_sample, build_gigahands_dataset, pose_gigahands_sample,
+    build_hot3d_dataset, pose_hot3d_sample)
 from hoidata.preprocess.preprocess_arctic import parse_description_labels
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
@@ -249,6 +251,26 @@ def _build_gigahands_sequence_list(ds):
     return seqs
 
 
+def _build_hot3d_sequence_list(ds):
+    """Dropdown metadata for the HOT3D dataset (no pose parsing / MANO posing).
+
+    Each index is one fixed-length clip of a recording; the label names the
+    recording, headset, frame window and the recording's objects.
+    """
+    seqs = []
+    for i in range(len(ds)):
+        m = ds.clip_meta(i)
+        window = m["seq_name"].split(":", 1)[1]
+        objs = ", ".join(m["obj_names"])
+        seqs.append({
+            "index": i,
+            "obj_name": objs,
+            "action_name": f"{m['recording']} [{m['headset']}] {window} | {objs}",
+            "nframes": int(m["nframes"]),
+        })
+    return seqs
+
+
 def _serialize_sample(sample):
     """Pack a posed sample into (meta_dict, blob_bytes).
 
@@ -257,6 +279,9 @@ def _serialize_sample(sample):
       - per-side hand faces   (int32,   (1538, 3)) for each active side
       - object verts          (float32, (T, Vo, 3))
       - per-side hand verts    (float32, (T, 778, 3)) for each active side
+      - optional per-frame visibility masks (int32, (T,)): ``obj_visible``,
+        ``hand_visible_{side}``, ``extra_visible_{name}`` — 0 hides that mesh
+        on the frame (e.g. HOT3D frames whose pose was not tracked)
     The manifest records dtype / offset (bytes) / shape for every array so the
     client can slice the ArrayBuffer without guessing strides.
     """
@@ -304,6 +329,18 @@ def _serialize_sample(sample):
     if has_contact:
         _add("obj_contact", np.asarray(sample["obj_contact"])[:nframes], np.float32)
 
+    # Optional per-frame visibility masks (T,): the client hides a mesh on frames
+    # where its mask is 0 (pose not tracked). Meshes without a mask always show.
+    if sample.get("obj_visible") is not None:
+        _add("obj_visible", np.asarray(sample["obj_visible"])[:nframes], np.int32)
+    hand_visible = sample.get("hand_visible") or {}
+    for side in hand_sides:
+        if hand_visible.get(side) is not None:
+            _add(f"hand_visible_{side}", np.asarray(hand_visible[side])[:nframes], np.int32)
+    for ex in extras:
+        if ex.get("visible") is not None:
+            _add(f"extra_visible_{ex['name']}", np.asarray(ex["visible"])[:nframes], np.int32)
+
     # Annotation intervals (may be empty). Keys are plain ints/str → JSON-safe.
     labels = [
         {"start": int(l["start"]), "end": int(l["end"]),
@@ -329,7 +366,9 @@ def _serialize_sample(sample):
     # normal to that plane, and the table sits at the object's lowest coordinate
     # along it, centered on the object's centroid in the other two axes. The plane
     # is per-dataset (``cfg.table_plane``): "xoy" (up=z, default) for GRAB/ARCTIC,
-    # "xoz" (up=y) for GigaHands. Shipped as a static (non-animated) quad.
+    # "xoz" (up=y) for GigaHands. A sample may override it with its own
+    # ``table_plane`` (HOT3D: Aria recordings are z-up, Quest3 y-up). Shipped as a
+    # static (non-animated) quad.
     #
     # The reference frame is the first frame where the object is actually tracked
     # (``table_frame`` from the sample; defaults to 0). GigaHands leaves untracked
@@ -339,7 +378,8 @@ def _serialize_sample(sample):
     table_frame = max(0, min(table_frame, obj_verts.shape[0] - 1))
     ov0 = obj_verts[table_frame]                           # (Vo, 3)
     # up_axis is normal to the table plane; the other two axes span the square.
-    up_axis = 1 if str(STATE["cfg"].get("table_plane", "xoy")).lower() == "xoz" else 2
+    table_plane = sample.get("table_plane") or STATE["cfg"].get("table_plane", "xoy")
+    up_axis = 1 if str(table_plane).lower() == "xoz" else 2
     a0, a1 = [ax for ax in (0, 1, 2) if ax != up_axis]     # the two spanning axes
     up_val = float(ov0[:, up_axis].min())
     c0, c1 = float(ov0[:, a0].mean()), float(ov0[:, a1].mean())
@@ -361,6 +401,9 @@ def _serialize_sample(sample):
         "subject": str(sample.get("subject", "")),
         "hand_colors": {s: HAND_SIDE_COLORS[s] for s in hand_sides},
         "obj_color": OBJECT_COLOR,
+        # Optional main-object opacity; None lets the client pick (0.5 when
+        # extras are overlaid, else opaque).
+        "obj_opacity": sample.get("obj_opacity"),
         "has_contact": bool(has_contact),
         "label_colors": LABEL_COLORS,
         "labels": labels,
@@ -411,6 +454,11 @@ def _get_sequence_payload(index):
         )
     elif STATE["dataset_name"] == "gigahands":
         sample = pose_gigahands_sample(
+            STATE["cfg"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    elif STATE["dataset_name"] == "hot3d":
+        sample = pose_hot3d_sample(
             STATE["cfg"], STATE["ds"],
             STATE["lhand_layer"], STATE["rhand_layer"], index,
         )
@@ -594,18 +642,23 @@ def main():
               f"aug_p={aug_p}) ...")
         ds, lhand_layer, rhand_layer = build_transition_dataset(
             cfg, args.split, aug_p=aug_p)
-    elif dataset_name == "gigahands":
+    elif dataset_name in ("gigahands", "hot3d"):
+        pretty = {"gigahands": "GigaHands", "hot3d": "HOT3D"}[dataset_name]
         if any(view_modes):
             parser.error("--transition / --bimanual / --wrist-aligned / "
                          "--stable-grasp / --segmented are not supported for the "
-                         "GigaHands config; use the plain world-frame view.")
-        print(f"Building GigaHands dataset (split={args.split}) ...")
-        ds, lhand_layer, rhand_layer = build_gigahands_dataset(cfg, args.split)
+                         f"{pretty} config; use the plain world-frame view.")
+        print(f"Building {pretty} dataset (split={args.split}) ...")
+        build = (build_gigahands_dataset if dataset_name == "gigahands"
+                 else build_hot3d_dataset)
+        ds, lhand_layer, rhand_layer = build(cfg, args.split)
     else:
         print(f"Building dataset ({dataset_name}, split={args.split}) ...")
         ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
     if dataset_name == "gigahands":
         sequences = _build_gigahands_sequence_list(ds)
+    elif dataset_name == "hot3d":
+        sequences = _build_hot3d_sequence_list(ds)
     else:
         sequences = _build_sequence_list(
             ds, transition=args.transition or args.bimanual,

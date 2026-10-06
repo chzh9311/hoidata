@@ -73,7 +73,8 @@ window.addEventListener('resize', resize);
 
 // ---------------------------------------------------------------- scene state
 // One entry per rendered mesh: { mesh, positions (Float32Array T*V*3), V,
-//   baseColor (THREE.Color) }.
+//   baseColor (THREE.Color), visible (Int32Array T, 0 = hidden that frame, or
+//   null = always shown) }.
 let meshes = [];
 let staticMeshes = [];         // non-animated scene geometry (e.g. the table top)
 let nframes = 0;
@@ -178,9 +179,10 @@ function buildScene(meta, buffer) {
 
   const arrays = meta.arrays;
   // When extra objects are overlaid in the same space (wrist-aligned view:
-  // true vs. reconstructed), draw the objects semitransparent so both read.
+  // true vs. reconstructed), draw the objects semitransparent so both read —
+  // unless the sample sets obj_opacity (HOT3D: extras are other opaque objects).
   const hasExtras = (meta.extras || []).length > 0;
-  const objOpacity = hasExtras ? 0.5 : 1.0;
+  const objOpacity = meta.obj_opacity ?? (hasExtras ? 0.5 : 1.0);
   const objFaces = new Uint32Array(viewArray(buffer, arrays.obj_faces)); // copy to Uint32
   const objVertsEntry = arrays.obj_verts;                                // (T, Vo, 3)
   const Vo = objVertsEntry.shape[1];
@@ -188,12 +190,16 @@ function buildScene(meta, buffer) {
   // Optional per-frame, per-hand contact heatmap (T, 2, Vo) = [left, right].
   const hasContact = !!meta.has_contact && !!arrays.obj_contact;
   const objContact = hasContact ? viewArray(buffer, arrays.obj_contact) : null;
+  // Optional per-frame visibility mask (T,): 0 hides the mesh on that frame
+  // (e.g. HOT3D frames whose pose was not tracked). Absent → always shown.
+  const visMask = (name) => (arrays[name] ? viewArray(buffer, arrays[name]) : null);
   meshes.push({
     mesh: makeMesh(objVerts.subarray(0, Vo * 3), objFaces, meta.obj_color, Vo,
                    objOpacity, hasContact),
     positions: objVerts, V: Vo,
     baseColor: new THREE.Color(...meta.obj_color),
     contact: objContact,          // (T*2*Vo) flat [left,right] per frame, or null
+    visible: visMask('obj_visible'),
   });
 
   for (const side of meta.hand_sides) {
@@ -207,6 +213,7 @@ function buildScene(meta, buffer) {
       mesh: makeMesh(verts.subarray(0, V * 3), faces, col, V),
       positions: verts, V,
       baseColor: new THREE.Color(...col),
+      visible: visMask('hand_visible_' + side),
     });
   }
 
@@ -223,6 +230,7 @@ function buildScene(meta, buffer) {
       mesh: makeMesh(verts.subarray(0, V * 3), faces, ex.color, V, exOpacity),
       positions: verts, V,
       baseColor: new THREE.Color(...ex.color),
+      visible: visMask('extra_visible_' + ex.name),
     });
   }
 
@@ -485,7 +493,10 @@ function frameSceneToBBox() {
   let mx = [-Infinity, -Infinity, -Infinity];
   for (const m of meshes.concat(staticMeshes)) {
     const p = m.positions;
+    const stride = m.V * 3;
     for (let i = 0; i < p.length; i += 3) {
+      // Skip frames where this mesh is hidden (untracked placeholder poses).
+      if (m.visible && !m.visible[Math.floor(i / stride)]) continue;
       for (let k = 0; k < 3; k++) {
         const v = p[i + k];
         if (v < mn[k]) mn[k] = v;
@@ -510,6 +521,10 @@ function frameSceneToBBox() {
 function setFrame(t) {
   frameIdx = t;
   for (const m of meshes) {
+    // Hide the mesh on frames where its pose is missing; skip the vertex upload.
+    const shown = !m.visible || m.visible[t] !== 0;
+    m.mesh.visible = shown;
+    if (!shown) continue;
     const stride = m.V * 3;
     const src = m.positions.subarray(t * stride, (t + 1) * stride);
     const attr = m.mesh.geometry.getAttribute('position');

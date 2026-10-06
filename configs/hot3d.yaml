@@ -1,0 +1,27 @@
+name: "hot3d"
+dataset_root: "data/hot3d_raw"                 # assets/ (instance.json, <uid>.glb) + P00xx_<hash>/ recordings
+
+# --- clips ------------------------------------------------------------------
+# Each recording (~2 min at 30 Hz) is cut into clip_len-frame windows.
+clip_len: 300            # frames per clip; -1 = one clip per whole recording
+clip_stride: null        # frame step between clip starts; null = clip_len (no overlap)
+min_clip_len: 30         # drop a trailing clip shorter than this
+
+# --- subset selection -------------------------------------------------------
+headsets: null           # null (both) | [Aria] | [Quest3]
+# Split by participant: these are held out, every other participant is train.
+val_participants: [P0017]
+test_participants: [P0021]
+# Aria logs poses for two camera streams ~0.1 ms apart; timestamps closer than
+# this are merged into one frame (also the hand-to-frame matching tolerance).
+merge_tol_ms: 5.0
+
+# --- viewer -----------------------------------------------------------------
+# No table_plane: it follows each recording's world up axis
+# (Aria z-up -> xoy, Quest3 y-up -> xoz).
+viewer_max_obj_faces: 4000   # decimate object meshes above this many faces (<=0: off)
+
+# --- MANO -------------------------------------------------------------------
+mano_root: "/home/zxc417/data/mano_v1_2/models"
+flat_hand: True          # x-data holds the absolute pose (PCA expanded with the MANO mean)
+use_pca: False

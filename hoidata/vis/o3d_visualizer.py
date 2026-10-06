@@ -290,6 +290,183 @@ def pose_gigahands_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> 
     }
 
 
+def build_hot3d_dataset(cfg, split: str = "test"):
+    """Build the MANO layers and the HOT3D dataset for the viewer.
+
+    HOT3D x-data stores the absolute 45-D finger pose (PCA expanded with the
+    MANO mean pose), so the layers use ``flat_hand_mean=True``.  HOT3D's hand
+    shapes were fit with the corrected MANO_LEFT shape blend shapes, so the left
+    layer gets the same fix (``fix_mano_left_shapedirs``) before posing with the
+    recording's betas.
+
+    Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    from hoidata.dataloaders.hot3d_dataset import MotionHOT3D
+    from hoidata.utils.hand_proc import fix_mano_left_shapedirs
+
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.get("flat_hand", True),
+        mano_root=cfg.mano_root, use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.get("flat_hand", True),
+        mano_root=cfg.mano_root, use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    fix_mano_left_shapedirs(lhand_layer, rhand_layer)
+
+    ds = MotionHOT3D(
+        dataset_root=cfg.get("dataset_root", "data/hot3d_raw"),
+        split=split,
+        clip_len=cfg.get("clip_len", 300),
+        clip_stride=cfg.get("clip_stride", None),
+        min_clip_len=cfg.get("min_clip_len", 30),
+        headsets=cfg.get("headsets", None),
+        val_participants=cfg.get("val_participants", ["P0017"]),
+        test_participants=cfg.get("test_participants", ["P0021"]),
+        merge_tol_ms=cfg.get("merge_tol_ms", 5.0),
+        mano_root=cfg.mano_root,
+    )
+    return ds, lhand_layer, rhand_layer
+
+
+#: Decimated HOT3D object meshes, keyed by (glb path, max faces).
+_HOT3D_MESH_CACHE = {}
+
+#: Colors for HOT3D objects 1..K-1 (object 0 uses OBJECT_COLOR).
+HOT3D_EXTRA_OBJECT_COLORS = [
+    (0.95, 0.75, 0.35), (0.55, 0.80, 0.55), (0.85, 0.55, 0.80),
+    (0.45, 0.80, 0.85), (0.90, 0.55, 0.45), (0.70, 0.70, 0.45),
+]
+
+
+def _load_hot3d_mesh(path, max_faces=4000):
+    """Load a HOT3D ``.glb`` object mesh in metres, decimated for the viewer.
+
+    The glb node transform scales the CAD model from mm to m; ``force="mesh"``
+    bakes it in.  Meshes above ``max_faces`` (up to ~200k verts) are reduced by
+    quadric decimation so a multi-object clip stays a reasonable payload
+    (``max_faces <= 0`` keeps the full mesh).  Results are memoised.
+
+    Returns ``(verts (V, 3) float32, faces (F, 3) int64)``.
+    """
+    key = (path, int(max_faces))
+    if key in _HOT3D_MESH_CACHE:
+        return _HOT3D_MESH_CACHE[key]
+    mesh = trimesh.load(path, process=False, force="mesh")
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if max_faces > 0 and len(faces) > max_faces:
+        o3d_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(faces))
+        # glTF splits vertices along UV seams; weld them so decimation does not
+        # tear the surface apart.
+        o3d_mesh = o3d_mesh.merge_close_vertices(1e-6)
+        o3d_mesh = o3d_mesh.simplify_quadric_decimation(int(max_faces))
+        o3d_mesh.remove_unreferenced_vertices()
+        verts = np.asarray(o3d_mesh.vertices)
+        faces = np.asarray(o3d_mesh.triangles, dtype=np.int64)
+    _HOT3D_MESH_CACHE[key] = (verts.astype(np.float32), faces)
+    return _HOT3D_MESH_CACHE[key]
+
+
+def pose_hot3d_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
+    """Pose one HOT3D clip (hands + all objects) in the world frame for the viewer.
+
+    Hands are built from ``x_lhand`` / ``x_rhand`` with the recording's MANO
+    betas; only hands tracked somewhere in the clip are drawn.  Object 0 is the
+    main object mesh (unless it is never tracked in the clip, then the first
+    tracked object takes its place); the others are shipped as opaque
+    ``extra_meshes``, each posed from its ``x_obj[:, k]`` as ``R @ v + t``.
+
+    Untracked frames are not interpolated: per-frame visibility masks
+    (``hand_visible`` / ``obj_visible`` / each extra's ``visible``, from the
+    dataset's ``*_valid`` masks) make the viewer hide a hand / object on the
+    frames where its pose is missing.  The table plane follows the recording's
+    world up axis (Aria z-up → ``xoy``, Quest3 y-up → ``xoz``).
+    """
+    item = ds[index]
+    nframes = int(item["nframes"])
+
+    hand_sides = []
+    hand_blocks = []
+    hand_visible = {}
+    for side, layer in (("left", lhand_layer), ("right", rhand_layer)):
+        s = side[0]
+        if not item[f"is_{s}hand"]:
+            continue
+        hand_sides.append(side)
+        hand_blocks.append(_pose_hand_with_beta(
+            item[f"x_{s}hand"], item[f"{s}hand_beta"], layer))
+        hand_visible[side] = np.asarray(item[f"{s}hand_valid"][:nframes], bool)
+    hand_verts = (np.concatenate(hand_blocks, axis=1)
+                  if hand_blocks else np.zeros((nframes, 0, 3), np.float32))
+
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    max_faces = int(cfg.get("viewer_max_obj_faces", 4000))
+    x_obj = np.asarray(item["x_obj"], dtype=np.float32)[:nframes]       # (T, K, 9)
+    obj_valid = np.asarray(item["obj_valid"], bool)[:nframes]           # (T, K)
+    posed = []
+    for k, mesh_path in enumerate(item["obj_meshes"]):
+        verts, faces = _load_hot3d_mesh(mesh_path, max_faces)
+        obj_verts = process_obj_result(
+            proc_torch_cuda(verts), proc_torch_cuda(x_obj[:, k]), "hot3d")
+        posed.append((proc_numpy(obj_verts).astype(np.float32), faces,
+                      obj_valid[:, k]))
+
+    # Main object: object 0, unless it is never tracked in this clip (the table
+    # is placed under the main object, so it needs at least one tracked frame).
+    tracked = [k for k in range(len(posed)) if posed[k][2].any()]
+    main = 0 if (not tracked or 0 in tracked) else tracked[0]
+    if posed:
+        obj_verts, obj_faces, obj_visible = posed[main]
+    else:
+        obj_verts = np.zeros((nframes, 1, 3), np.float32)
+        obj_faces = np.zeros((0, 3), np.int64)
+        obj_visible = np.zeros(nframes, bool)
+    extra_meshes = [
+        {
+            "name": f"obj{k}",
+            "faces": faces,
+            "verts": verts,
+            "visible": visible,
+            "color": HOT3D_EXTRA_OBJECT_COLORS[i % len(HOT3D_EXTRA_OBJECT_COLORS)],
+            "opacity": 1.0,
+        }
+        for i, (k, (verts, faces, visible)) in enumerate(
+            (k, p) for k, p in enumerate(posed) if k != main)
+    ]
+
+    # Table reference: the first frame with a tracked pose for the main object.
+    idxs = np.nonzero(obj_visible)[0]
+    table_frame = int(idxs[0]) if len(idxs) else 0
+
+    return {
+        "hand_verts": hand_verts,
+        "hand_faces": hand_faces,
+        "hand_sides": hand_sides,
+        "hand_visible": hand_visible,
+        "obj_verts": obj_verts,
+        "obj_faces": obj_faces,
+        "obj_visible": obj_visible,
+        "obj_opacity": 1.0,
+        "extra_meshes": extra_meshes,
+        "nframes": nframes,
+        "obj_name": ", ".join(item["obj_names"]),
+        "action_name": item["seq_name"],
+        "labels": [],
+        "subject": item["recording"],
+        "grasps": {"left": [], "right": []},
+        "table_frame": table_frame,
+        "table_plane": "xoz" if item["up_axis"] == "y" else "xoy",
+    }
+
+
 def pose_sample(cfg, dataset_name, ds, lhand_layer, rhand_layer, index: int = 0) -> dict:
     """Pose one full sequence from an already-built dataset, returning hand and
     object meshes already posed per frame.

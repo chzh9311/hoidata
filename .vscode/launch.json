@@ -128,6 +128,24 @@
             ]
         },
         {
+            // Launch the web viewer on HOT3D clips (world-frame hands + all
+            // tracked objects). Breakpoints: o3d_visualizer.py ->
+            // pose_hot3d_sample / _load_hot3d_mesh and hot3d_dataset.py ->
+            // MotionHOT3D._parse_recording.
+            "name": "Debug HOT3D viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hoidata.vis.web_viewer.run",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "python": "/home/zxc417/anaconda3/envs/hoi_common/bin/python",
+            "args": [
+                "--config", "configs/hot3d.yaml",
+                "--split", "test"
+            ]
+        },
+        {
             // Same viewer, but let you type extra args at launch (e.g. a
             // different --split / --port) via the arg picker.
             "name": "Debug wrist-aligned viewer (pick args)",
