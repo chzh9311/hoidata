@@ -5,5 +5,6 @@ Self-implemented dataset preprocessing, dataloaders, and viewers for HOI MoCap d
 Current implemented datasets:
 
 * [GRAB](https://github.com/otaheri/GRAB)
+* [ARCTIC](https://github.com/zc-alexfan/arctic)
 * [GiGaHands](https://github.com/brown-ivl/GigaHands)
 * [Aria HOT3D](https://facebookresearch.github.io/hot3d/)
