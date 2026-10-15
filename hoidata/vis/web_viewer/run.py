@@ -40,7 +40,8 @@ from hoidata.vis.o3d_visualizer import (
     build_stable_grasp_dataset, pose_wrist_aligned_sample,
     build_bimanual_stable_grasp_dataset, pose_bimanual_stable_grasp_sample,
     pose_segmented_sample, build_gigahands_dataset, pose_gigahands_sample,
-    build_hot3d_dataset, pose_hot3d_sample)
+    build_hot3d_dataset, pose_hot3d_sample,
+    build_hot3d_segment_dataset, pose_hot3d_segment_sample)
 from hoidata.preprocess.preprocess_arctic import parse_description_labels
 
 HAND_SIDE_COLORS = {"left": [0.9, 0.75, 0.65], "right": [0.75, 0.85, 0.95]}
@@ -82,6 +83,7 @@ STATE = {
     "wrist_aligned": False,  # True → wrist-frame original vs. reconstructed object
     "stable_grasp": False,   # True → world-frame bimanual stable-grasp segments
     "segmented": False,      # True → full sequence + null/transition/SG action track
+    "single_object": False,  # True → HOT3D single-object segments (MotionHOT3D)
     "label_mode": False,     # True → action-label editing enabled (ARCTIC only)
     "label_dir": None,        # working-copy dir for editable description.txt files
     "seq_meta": [],           # index -> {subject, action_name, nframes} (label mode)
@@ -271,6 +273,27 @@ def _build_hot3d_sequence_list(ds):
     return seqs
 
 
+def _build_hot3d_segment_sequence_list(ds):
+    """Dropdown metadata for HOT3D single-object segments (no posing).
+
+    Label: segment id, headset, object and the active core (segment frames),
+    named after the segmentation's activity (contact / moving).
+    """
+    activity = getattr(ds, "seg_activity", "moving")
+    seqs = []
+    for i in range(len(ds)):
+        s0 = int(ds.start_frame[i])
+        core = f"{int(ds.move_start[i]) - s0}-{int(ds.move_end[i]) - s0}"
+        seqs.append({
+            "index": i,
+            "obj_name": str(ds.obj_name[i]),
+            "action_name": (f"{ds.seq_name[i]} [{ds.headset[i]}] "
+                            f"{ds.obj_name[i]} | {activity} {core}"),
+            "nframes": int(ds.nframes[i]),
+        })
+    return seqs
+
+
 def _serialize_sample(sample):
     """Pack a posed sample into (meta_dict, blob_bytes).
 
@@ -409,7 +432,7 @@ def _serialize_sample(sample):
         "labels": labels,
         "grasps": grasps,
         "segments": segments,
-        "segment_colors": SEGMENT_COLORS,
+        "segment_colors": sample.get("segment_colors") or SEGMENT_COLORS,
         "table_color": TABLE_COLOR,
         "extras": [
             {"name": ex["name"], "color": list(ex["color"]),
@@ -427,7 +450,12 @@ def _get_sequence_payload(index):
     """Return (meta, blob) for a sequence, posing + caching on first request."""
     if index in STATE["cache"]:
         return STATE["cache"][index]
-    if STATE["segmented"]:
+    if STATE["single_object"]:
+        sample = pose_hot3d_segment_sample(
+            STATE["cfg"], STATE["ds"],
+            STATE["lhand_layer"], STATE["rhand_layer"], index,
+        )
+    elif STATE["segmented"]:
         sample = pose_segmented_sample(
             STATE["cfg"], STATE["dataset_name"], STATE["ds"],
             STATE["lhand_layer"], STATE["rhand_layer"], index,
@@ -586,6 +614,13 @@ def main():
                              "at the bottom: null grasp (gray) / transition action "
                              "(+-5 frames around each grasp-count change) / stable "
                              "grasp. GRAB config only.")
+    parser.add_argument("--single-object", action="store_true",
+                        help="View HOT3D single-object interaction segments "
+                             "(MotionHOT3D): one object's contact (or moving) "
+                             "interval plus its transition frames, with the core "
+                             "marked on the bottom track and per-hand contact on "
+                             "the L/R grasp tracks. Builds the preprocessed "
+                             "segments first if missing. HOT3D config only.")
     parser.add_argument("--label", action="store_true",
                         help="Enable action-label editing (ARCTIC full_motion only). "
                              "Edits persist to data/{dataset}_description/ and sync "
@@ -596,19 +631,25 @@ def main():
     dataset_name = cfg.name
 
     view_modes = [args.transition, args.bimanual, args.wrist_aligned,
-                  args.stable_grasp, args.segmented]
+                  args.stable_grasp, args.segmented, args.single_object]
     if sum(bool(m) for m in view_modes) > 1:
         parser.error("--transition / --bimanual / --wrist-aligned / --stable-grasp "
-                     "/ --segmented are mutually exclusive.")
+                     "/ --segmented / --single-object are mutually exclusive.")
 
     if args.label:
         if dataset_name != "arctic" or not cfg.get("full_motion", False):
             parser.error("--label is only supported for the ARCTIC full_motion config.")
         if any(view_modes):
             parser.error("--label cannot be combined with --transition / "
-                         "--bimanual / --wrist-aligned / --stable-grasp / --segmented.")
+                         "--bimanual / --wrist-aligned / --stable-grasp / --segmented / "
+                         "--single-object.")
 
-    if args.segmented:
+    if args.single_object:
+        if dataset_name != "hot3d":
+            parser.error("--single-object is only supported for the HOT3D config.")
+        print(f"Building HOT3D single-object segment dataset (split={args.split}) ...")
+        ds, lhand_layer, rhand_layer = build_hot3d_segment_dataset(cfg, args.split)
+    elif args.segmented:
         if dataset_name != "grab":
             parser.error("--segmented is only supported for the GRAB config.")
         print(f"Building GRAB dataset (split={args.split}) for the "
@@ -655,7 +696,9 @@ def main():
     else:
         print(f"Building dataset ({dataset_name}, split={args.split}) ...")
         ds, lhand_layer, rhand_layer = build_dataset(cfg, dataset_name, args.split)
-    if dataset_name == "gigahands":
+    if args.single_object:
+        sequences = _build_hot3d_segment_sequence_list(ds)
+    elif dataset_name == "gigahands":
         sequences = _build_gigahands_sequence_list(ds)
     elif dataset_name == "hot3d":
         sequences = _build_hot3d_sequence_list(ds)
@@ -682,12 +725,14 @@ def main():
         "wrist_aligned": args.wrist_aligned,
         "stable_grasp": args.stable_grasp,
         "segmented": args.segmented,
+        "single_object": args.single_object,
         "label_mode": args.label,
         "label_dir": label_dir,
         "seq_meta": seq_meta,
     })
 
-    kind = ("segmented sequences" if args.segmented
+    kind = ("single-object segments" if args.single_object
+            else "segmented sequences" if args.segmented
             else "bimanual stable grasps" if args.stable_grasp
             else "stable grasps" if args.wrist_aligned
             else "bimanual transitions" if args.bimanual

@@ -78,6 +78,7 @@ button.nav:hover { background: #414653; }
   pointer-events: none;
 }
 #status.loading { color: #ffd479; }
+#status.error { color: #ff7b7b; }
 
 /* --- bottom controls --- */
 #controls {

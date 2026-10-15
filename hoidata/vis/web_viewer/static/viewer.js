@@ -47,7 +47,18 @@ scene.background = new THREE.Color(0x1b1d23);
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
 camera.position.set(0, 0.4, 1.2);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// Creating the WebGL context is the step that fails on a browser without
+// usable WebGL (GPU disabled / blocklisted, or Chrome blocking WebGL for this
+// site after repeated GPU context losses). Say so instead of hanging.
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+} catch (err) {
+  statusEl.textContent = 'viewer error: WebGL unavailable (' + err.message + '). '
+    + 'Check chrome://gpu, enable hardware acceleration, or restart the browser.';
+  statusEl.classList.add('error');
+  throw err;
+}
 renderer.setPixelRatio(window.devicePixelRatio);
 viewport.appendChild(renderer.domElement);
 
@@ -132,6 +143,10 @@ function makeMesh(positionsFrame0, faces, colorArr, V, opacity = 1.0, vertexColo
     depthWrite: !transparent,
   });
   const mesh = new THREE.Mesh(geom, material);
+  // Vertices are rewritten every frame (setFrame) but three.js caches the
+  // bounding sphere from the first rendered frame, so frustum culling would
+  // test a stale position and could drop a moving mesh when zoomed in.
+  mesh.frustumCulled = false;
   scene.add(mesh);
   return mesh;
 }
@@ -175,7 +190,18 @@ function buildScene(meta, buffer) {
   // Show the action-split track + legend only when segments are provided.
   const hasSegments = segments.length > 0;
   if (trackSeg) trackSeg.hidden = !hasSegments;
-  if (segLegend) segLegend.hidden = !hasSegments;
+  if (segLegend) {
+    segLegend.hidden = !hasSegments;
+    // One swatch per segment type the sample defines colors for (GRAB:
+    // null / transition / stable grasp; HOT3D single-object: transition / moving).
+    segLegend.innerHTML = '';
+    for (const [type, col] of Object.entries(segmentColors)) {
+      const sw = document.createElement('i');
+      sw.className = 'sw';
+      sw.style.background = rgbCss(col);
+      segLegend.append(sw, type.replace('_', ' ') + ' ');
+    }
+  }
 
   const arrays = meta.arrays;
   // When extra objects are overlaid in the same space (wrist-aligned view:

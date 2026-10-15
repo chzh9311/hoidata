@@ -12,6 +12,8 @@ motion datasets:
 Dataset-specific subclasses live in:
 - ``common/data/grab_dataset.py``   (rigid objects, per-subject MANO vtemplates)
 - ``common/data/arctic_dataset.py`` (articulated objects, +1 articulation DoF)
+- ``hoidata/dataloaders/hot3d_dataset.py`` (rigid single-object HOT3D segments;
+  no text, no contact maps)
 
 ``MotionGRAB`` / ``MotionGRABDataModule`` are re-exported from this module (see the
 bottom of the file) so existing ``from common.data.action_dataset import
@@ -397,7 +399,8 @@ class MotionDatasetBase(Dataset):
             self._load_data(data, task, split)
 
         if task != "action_classify":
-            if task != "vae_training":
+            # text_json=None: dataset without text descriptions (e.g. HOT3D).
+            if task != "vae_training" and text_json is not None:
                 with open(text_json, "r") as f:
                     self.text_description = json.load(f)
             else:
@@ -613,7 +616,7 @@ class MotionDatasetBase(Dataset):
         is_lhand = self.is_lhand[index]
         is_rhand = self.is_rhand[index]
 
-        if is_lhand is not None:
+        if is_lhand is not None and getattr(self, "lcf_idx", None) is not None:
             item["is_lhand"] = is_lhand
             item["is_rhand"] = is_rhand
             # ---- Distance / coverage maps (shared) ----
@@ -637,6 +640,11 @@ class MotionDatasetBase(Dataset):
             rcov_map = get_contact_map(rcov_idx, 1024, is_rhand)
             cov_map = (lcov_map + rcov_map) > 0
             item["cov_map"] = cov_map.astype(np.float32)
+        elif is_lhand is not None:
+            # Per-sequence hand flags but no contact data (e.g. HOT3D): no
+            # distance / coverage maps.
+            item["is_lhand"] = is_lhand
+            item["is_rhand"] = is_rhand
         else:
             is_lhand = True
             is_rhand = True

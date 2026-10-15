@@ -301,7 +301,7 @@ def build_hot3d_dataset(cfg, split: str = "test"):
 
     Returns ``(ds, lhand_layer, rhand_layer)``.
     """
-    from hoidata.dataloaders.hot3d_dataset import MotionHOT3D
+    from hoidata.dataloaders.hot3d_dataset import MotionHOT3DMultiObj
     from hoidata.utils.hand_proc import fix_mano_left_shapedirs
 
     use_pca = cfg.get("use_pca", False)
@@ -316,7 +316,7 @@ def build_hot3d_dataset(cfg, split: str = "test"):
     ).cuda()
     fix_mano_left_shapedirs(lhand_layer, rhand_layer)
 
-    ds = MotionHOT3D(
+    ds = MotionHOT3DMultiObj(
         dataset_root=cfg.get("dataset_root", "data/hot3d_raw"),
         split=split,
         clip_len=cfg.get("clip_len", 300),
@@ -327,6 +327,7 @@ def build_hot3d_dataset(cfg, split: str = "test"):
         test_participants=cfg.get("test_participants", ["P0021"]),
         merge_tol_ms=cfg.get("merge_tol_ms", 5.0),
         mano_root=cfg.mano_root,
+        canonical_z_up=cfg.get("canonical_z_up", True),
     )
     return ds, lhand_layer, rhand_layer
 
@@ -463,6 +464,124 @@ def pose_hot3d_sample(cfg, ds, lhand_layer, rhand_layer, index: int = 0) -> dict
         "subject": item["recording"],
         "grasps": {"left": [], "right": []},
         "table_frame": table_frame,
+        "table_plane": "xoz" if item["up_axis"] == "y" else "xoy",
+    }
+
+
+#: Timeline colors for the HOT3D single-object segment view: the inactive
+#: transition frames before / after the core, and the object's active core
+#: (named after the segmentation's ``seg_activity``: contact / moving).
+HOT3D_SEGMENT_COLORS = {
+    "transition": [0.95, 0.70, 0.20],   # amber — no object active
+    "contact":    [0.20, 0.70, 0.75],   # teal  — only this object in contact
+    "moving":     [0.20, 0.70, 0.75],   # teal  — only this object moving
+}
+
+
+def _mask_intervals(mask):
+    """``[[start, end), ...]`` runs of True in a 1-D bool mask."""
+    m = np.concatenate([[False], np.asarray(mask, bool), [False]])
+    edges = np.flatnonzero(m[1:] != m[:-1])
+    return edges.reshape(-1, 2).tolist()
+
+
+def build_hot3d_segment_dataset(cfg, split: str = "test"):
+    """Build the MANO layers and the HOT3D single-object segment dataset.
+
+    Runs any missing / stale preprocessing first (``obj.pkl`` / ``data.npz``,
+    see ``preprocess_hot3d``), then loads ``MotionHOT3D`` with full-length
+    segments (``max_nframes=-1``).  The layers are the shared defaults;
+    ``MotionHOT3D`` derives per-participant shaped layers from them.
+
+    Returns ``(ds, lhand_layer, rhand_layer)``.
+    """
+    from hoidata.dataloaders.hot3d_dataset import MotionHOT3D
+    from hoidata.preprocess.preprocess_hot3d import run_missing_preprocessing
+
+    run_missing_preprocessing(cfg)
+    use_pca = cfg.get("use_pca", False)
+    ncomps = 6 if use_pca else 45
+    lhand_layer = ManoLayerWrapper(
+        side="left", flat_hand_mean=cfg.get("flat_hand", True),
+        mano_root=cfg.mano_root, use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    rhand_layer = ManoLayerWrapper(
+        side="right", flat_hand_mean=cfg.get("flat_hand", True),
+        mano_root=cfg.mano_root, use_pca=use_pca, ncomps=ncomps,
+    ).cuda()
+    ds = MotionHOT3D(
+        data_path=cfg.data_path,
+        data_obj_pc_path=cfg.data_obj_pc_path,
+        text_json=None,
+        max_nframes=-1,
+        task="evaluate",
+        split=split,
+        lhand_layer=lhand_layer,
+        rhand_layer=rhand_layer,
+        val_participants=cfg.get("val_participants", ["P0017"]),
+        test_participants=cfg.get("test_participants", ["P0021"]),
+    )
+    return ds, lhand_layer, rhand_layer
+
+
+def pose_hot3d_segment_sample(cfg, ds, lhand_layer, rhand_layer,
+                              index: int = 0) -> dict:
+    """Pose one HOT3D single-object segment (hands + its object) for the viewer.
+
+    Hands come from ``MotionHOT3D._getitem_full`` (per-participant shaped
+    layers); the object's ``.glb`` (decimated like the multi-object view) is
+    posed from ``x_obj`` as ``R @ v + t``.  Untracked frames are hidden via the
+    item's ``track_mask_*``.  The timeline's bottom track shows the segment's
+    split into transition frames and its active core (contact / moving); the
+    L / R grasp tracks show each hand's raw contact with the object.
+    """
+    item = ds[index]
+    nframes = int(item["nframes"])
+
+    hand_visible = {
+        side: np.asarray(item[f"track_mask_{side[0]}hand"][:nframes], bool)
+        for side in item["hand_sides"]
+    }
+    hand_faces = {
+        "left": proc_numpy(lhand_layer.th_faces),
+        "right": proc_numpy(rhand_layer.th_faces),
+    }
+
+    _, _, _, obj_path = ds.object_model(item["obj_name"])
+    obj_root = cfg.get("obj_root", osp.join(cfg.dataset_root, "assets"))
+    verts, obj_faces = _load_hot3d_mesh(
+        osp.join(obj_root, obj_path), int(cfg.get("viewer_max_obj_faces", 4000)))
+    obj_verts = proc_numpy(process_obj_result(
+        proc_torch_cuda(verts), proc_torch_cuda(item["x_obj"][:nframes]),
+        "hot3d")).astype(np.float32)
+    obj_visible = np.asarray(item["track_mask_obj"][:nframes], bool)
+
+    ms, me = int(item["move_start"]), int(item["move_end"])
+    core = str(item.get("seg_activity", "moving"))
+    segments = [{"start": s, "end": e, "type": t} for s, e, t in (
+        (0, ms, "transition"), (ms, me, core), (me, nframes, "transition"))
+        if e > s]
+    grasps = {side: _mask_intervals(item[f"contact_{side[0]}hand"][:nframes])
+              for side in ("left", "right")}
+
+    idxs = np.nonzero(obj_visible)[0]
+    return {
+        "hand_verts": item["hand_verts"],
+        "hand_faces": hand_faces,
+        "hand_sides": item["hand_sides"],
+        "hand_visible": hand_visible,
+        "obj_verts": obj_verts,
+        "obj_faces": obj_faces,
+        "obj_visible": obj_visible,
+        "nframes": nframes,
+        "obj_name": str(item["obj_name"]),
+        "action_name": item["seq_name"],
+        "labels": [],
+        "subject": str(item.get("subject", "")),
+        "grasps": grasps,
+        "segments": segments,
+        "segment_colors": {k: HOT3D_SEGMENT_COLORS[k] for k in ("transition", core)},
+        "table_frame": int(idxs[0]) if len(idxs) else 0,
         "table_plane": "xoz" if item["up_axis"] == "y" else "xoy",
     }
 

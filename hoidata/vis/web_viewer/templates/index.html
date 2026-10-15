@@ -62,11 +62,8 @@
       <span><i class="sw" style="background:#40bf59"></i>action</span>
       <span><i class="sw" style="background:#3373f2"></i>L grasp</span>
       <span><i class="sw" style="background:#e64040"></i>R grasp</span>
-      <span id="segLegend" hidden>
-        <i class="sw" style="background:#808080"></i>null
-        <i class="sw" style="background:#f2b333"></i>transition
-        <i class="sw" style="background:#40b366"></i>stable grasp
-      </span>
+      <!-- Filled per sequence from meta.segment_colors (viewer.js buildScene). -->
+      <span id="segLegend" hidden></span>
       <span id="activeLabel"></span>
     </div>
 
@@ -99,7 +96,17 @@
   <script>
     window.__FPS__ = {{ fps }};
     window.__LABEL_MODE__ = {{ 'true' if label_mode else 'false' }};
+    // Surface startup failures in the status badge instead of leaving it at
+    // "initializing…" (e.g. no WebGL context, or viewer.js failing to load).
+    window.__viewerError = (msg) => {
+      const s = document.getElementById('status');
+      if (s) { s.textContent = 'viewer error: ' + msg; s.classList.add('error'); }
+    };
+    window.addEventListener('error', (e) => window.__viewerError(e.message || String(e.error)));
+    window.addEventListener('unhandledrejection',
+      (e) => window.__viewerError(String((e.reason && e.reason.message) || e.reason)));
   </script>
-  <script type="module" src="{{ url_for('static', filename='viewer.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='viewer.js') }}"
+          onerror="window.__viewerError('could not load viewer.js')"></script>
 </body>
 </html>

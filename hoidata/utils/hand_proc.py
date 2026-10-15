@@ -72,3 +72,24 @@ def fix_mano_left_shapedirs(lhand_layer, rhand_layer):
     if torch.sum(torch.abs(l_dirs[:, 0, :] - r_dirs[:, 0, :])) < 1:
         l_dirs[:, 0, :] *= -1
     return lhand_layer
+
+
+def shaped_mano_layer(layer, beta):
+    """Copy of a MANO layer with the shape ``beta`` baked into its template.
+
+    Returns a deep copy of ``layer`` whose ``th_v_template`` is the shaped hand
+    ``v_template + shapedirs @ beta``.  Posing the copy with **zero betas** then
+    reproduces posing ``layer`` with ``beta`` — so code that hard-codes zero
+    betas (``transform_xdata_to_verts`` / ``_joints``) gets the right hand shape,
+    the same mechanism as GRAB's per-subject templates.  For the left hand,
+    apply ``fix_mano_left_shapedirs`` to ``layer`` first if the betas come from a
+    dataset fit with the corrected MANO_LEFT model (e.g. HOT3D).
+    """
+    import copy
+    out = copy.deepcopy(layer)
+    dirs = out.th_shapedirs                                     # (778, 3, 10)
+    b = torch.as_tensor(np.asarray(beta, dtype=np.float32).reshape(-1)[:dirs.shape[-1]],
+                        dtype=dirs.dtype, device=dirs.device)
+    out.th_v_template.data.copy_(
+        out.th_v_template + torch.einsum("vdk,k->vd", dirs, b)[None])
+    return out

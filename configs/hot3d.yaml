@@ -1,24 +1,71 @@
 name: "hot3d"
 dataset_root: "data/hot3d_raw"                 # assets/ (instance.json, <uid>.glb) + P00xx_<hash>/ recordings
 
-# --- clips ------------------------------------------------------------------
+obj_root: "data/hot3d_raw/assets"              # object .glb meshes + instance.json
+
+# --- multi-object clips (MotionHOT3DMultiObj, web viewer) ---------------------
 # Each recording (~2 min at 30 Hz) is cut into clip_len-frame windows.
 clip_len: 300            # frames per clip; -1 = one clip per whole recording
 clip_stride: null        # frame step between clip starts; null = clip_len (no overlap)
 min_clip_len: 30         # drop a trailing clip shorter than this
+
+# --- single-object segments (MotionHOT3D, MotionGRAB interface) ---------------
+# Built by `python -m hoidata.preprocess.preprocess_hot3d --config configs/hot3d.yaml`
+# (or MotionHOT3DDataModule.prepare_data); rebuilt when the seg_* params change.
+data_path: "data/output/hot3d/data.npz"
+data_obj_pc_path: "data/output/hot3d/obj.pkl"
+max_nframes: 150         # random training window length; -1 = whole segment
+data_ratio: 1
+# Which frames count as "object k is interacted with":
+#   contact -> either hand within seg_contact_thr of the object's surface
+#   moving  -> the object moves (seg_window / seg_trans_thr / seg_rot_thr below)
+seg_activity: contact
+# Contact: nearest distance between a hand's MANO vertices and the object's
+# surface (dense samples every seg_contact_spacing m, plus mesh vertices).
+seg_contact_thr: 0.005
+seg_contact_spacing: 0.002
+# Motion (seg_activity: moving): a seg_window-frame sliding window (over the
+# object's tracked frames) is moving if max - min of any translation dim >
+# seg_trans_thr (m) or of any rot6d dim > seg_rot_thr. Static jitter is ~0.5 mm / ~0.01.
+seg_window: 5
+seg_trans_thr: 0.005
+seg_rot_thr: 0.05
+seg_merge_gap: 10            # join active runs separated by < this many frames
+# After joining, ignore active runs shorter than this (frames): brief brushes of
+# a neighbouring object would otherwise count as multi-object frames and split
+# the held object's interval.
+seg_min_active_len: 10
+# Merge consecutive active intervals of the SAME object separated only by
+# all-inactive frames into one segment; those frames become part of the core.
+# Never merges across a multi-object or another object's interval.
+# seg_same_obj_max_gap caps the absorbed gap (frames; null = any).
+seg_merge_same_obj: True
+seg_same_obj_max_gap: null
+# A segment = one object's active interval (its core; frames with >1 active
+# object are dropped) + the all-inactive transition frames directly before /
+# after it.
+seg_max_transition_len: null # cap each transition extension (frames); null = no cap
+seg_min_move_len: 0          # drop segments whose core is shorter (frames)
+# Drop segments whose object is tracked on less than this fraction of frames.
+# Segments whose object is never tracked are always dropped.
+seg_min_obj_tracked: 0.0
 
 # --- subset selection -------------------------------------------------------
 headsets: null           # null (both) | [Aria] | [Quest3]
 # Split by participant: these are held out, every other participant is train.
 val_participants: [P0017]
 test_participants: [P0021]
+# Rotate Quest3 recordings (raw +Y up) to +Z up so every recording shares GRAB's
+# up axis (Aria is already +Z up). Heights are not shifted: the Quest3 floor is
+# at z ~ 0, the Aria origin is near the headset. Changing it rebuilds data.npz.
+canonical_z_up: True
 # Aria logs poses for two camera streams ~0.1 ms apart; timestamps closer than
 # this are merged into one frame (also the hand-to-frame matching tolerance).
 merge_tol_ms: 5.0
 
 # --- viewer -----------------------------------------------------------------
-# No table_plane: it follows each recording's world up axis
-# (Aria z-up -> xoy, Quest3 y-up -> xoz).
+# No table_plane: it follows each item's up_axis (xoy for z-up; xoz for the raw
+# Quest3 y-up frame when canonical_z_up is off).
 viewer_max_obj_faces: 4000   # decimate object meshes above this many faces (<=0: off)
 
 # --- MANO -------------------------------------------------------------------
