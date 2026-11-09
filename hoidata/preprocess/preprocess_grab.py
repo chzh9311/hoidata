@@ -443,7 +443,7 @@ def print_text_data_num(cfg):
         print(f"text num: {len(json.load(f))}")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="grab")
+@hydra.main(version_base=None, config_path="../../configs", config_name="grab")
 def main(cfg):
     preprocessing_object(cfg)
     preprocessing_data(cfg)
